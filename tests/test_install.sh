@@ -49,7 +49,7 @@ n=$(grep -c "^$BEGIN_KEY" "$H1/.zshrc" 2>/dev/null || echo 0)
 head_ "2) 重复安装应幂等（连跑三次，.zshrc 不能变长）"
 before_lines=$(wc -l < "$H1/.zshrc")
 bk_before=$(ls "$H1"/.zshrc.bak-ag-* 2>/dev/null | wc -l | tr -d ' ')
-for i in 1 2 3; do run_install "$H1" >/dev/null; done
+for _ in 1 2 3; do run_install "$H1" >/dev/null; done
 after_lines=$(wc -l < "$H1/.zshrc")
 bk_after=$(ls "$H1"/.zshrc.bak-ag-* 2>/dev/null | wc -l | tr -d ' ')
 n=$(grep -c "^${BEGIN_KEY}" "$H1/.zshrc")

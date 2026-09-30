@@ -1,3 +1,6 @@
+# shellcheck shell=zsh
+# （shellcheck 对 zsh 支持不完整，本文件不纳入 CI 的 shellcheck 检查，
+#   只做 zsh -n 语法校验；见 tests/lint.sh）
 # ============================================================
 #  ag — Agent Gateway 的 zsh 集成
 #  由 ~/.zshrc 里的一行 source 引入

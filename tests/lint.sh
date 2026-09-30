@@ -42,10 +42,21 @@ PY
 
 # --- 2. shell 语法 -------------------------------------------------------
 printf '\n2) shell 语法\n'
-for f in "$REPO/install.sh" "$REPO/tests/test_install.sh" "$REPO/ag.zsh"; do
+for f in "$REPO"/*.sh "$REPO"/tests/*.sh; do
   [ -f "$f" ] || continue
-  if bash -n "$f" 2>/dev/null; then ok "$(basename "$f")"; else bad "$(basename "$f") 语法错误"; fi
+  if bash -n "$f" 2>/dev/null; then ok "$(basename "$f")  (bash -n)"
+  else bad "$(basename "$f") bash 语法错误"; fi
 done
+# .zsh 得用 zsh 自己校验 —— bash -n 看不懂 ${(f)...} 这类 zsh 语法，过了也不算数
+if command -v zsh >/dev/null 2>&1; then
+  for f in "$REPO"/*.zsh; do
+    [ -f "$f" ] || continue
+    if zsh -n "$f" 2>/dev/null; then ok "$(basename "$f")  (zsh -n)"
+    else bad "$(basename "$f") zsh 语法错误"; fi
+  done
+else
+  printf '  \033[90m· 没装 zsh，跳过 .zsh 语法校验\033[0m\n'
+fi
 
 # --- 3. 目标脚本必须是可执行的 -------------------------------------------
 printf '\n3) 可执行位\n'
@@ -67,7 +78,8 @@ fi
 # --- 5. shellcheck（有就跑）---------------------------------------------
 printf '\n5) shellcheck\n'
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck -S warning "$REPO/install.sh" "$REPO/tests/test_install.sh"; then
+  # 只查 bash 脚本：shellcheck 的 zsh 支持不完整，ag.zsh 查了都是误报
+  if shellcheck -S warning "$REPO"/*.sh "$REPO"/tests/*.sh; then
     ok "shellcheck 通过"
   else
     bad "shellcheck 有告警"
