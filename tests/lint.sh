@@ -42,7 +42,7 @@ PY
 
 # --- 2. shell 语法 -------------------------------------------------------
 printf '\n2) shell 语法\n'
-for f in "$REPO"/*.sh "$REPO"/tests/*.sh; do
+for f in "$REPO"/*.sh "$REPO"/tests/*.sh "$REPO"/docs/*.sh; do
   [ -f "$f" ] || continue
   if bash -n "$f" 2>/dev/null; then ok "$(basename "$f")  (bash -n)"
   else bad "$(basename "$f") bash 语法错误"; fi
@@ -60,7 +60,8 @@ fi
 
 # --- 3. 目标脚本必须是可执行的 -------------------------------------------
 printf '\n3) 可执行位\n'
-for f in "$REPO/ag" "$REPO/install.sh" "$REPO/tests/test_install.sh" "$REPO/tests/test_ag.py"; do
+for f in "$REPO/ag" "$REPO/install.sh" "$REPO/tests/test_install.sh" \
+         "$REPO/tests/test_ag.py" "$REPO/docs/record-demo.sh" "$REPO/docs/make-demo-cast.py"; do
   [ -x "$f" ] && ok "$(basename "$f")" || bad "$(basename "$f") 没有可执行位"
 done
 
@@ -79,7 +80,7 @@ fi
 printf '\n5) shellcheck\n'
 if command -v shellcheck >/dev/null 2>&1; then
   # 只查 bash 脚本：shellcheck 的 zsh 支持不完整，ag.zsh 查了都是误报
-  if shellcheck -S warning "$REPO"/*.sh "$REPO"/tests/*.sh; then
+  if shellcheck -S warning "$REPO"/*.sh "$REPO"/tests/*.sh "$REPO"/docs/*.sh; then
     ok "shellcheck 通过"
   else
     bad "shellcheck 有告警"

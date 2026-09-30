@@ -10,6 +10,8 @@ Claude Code, Codex, Gemini, Grok, OpenCode, OpenClaw, Hermes, Pi, Goose, Kimi…
 Stop memorizing a dozen different launch commands and a dozen shell aliases.
 Put them all behind one fuzzy picker, and add your own by editing one line.
 
+![demo](docs/demo.gif)
+
 ```bash
 ag            # 模糊选择器：打字即筛选，回车启动
 ag cc         # 直接进 Claude Code
@@ -17,17 +19,11 @@ ag ot-design  # 直接进 OpenClaw 的 design 会话
 ag cc --resume   # 参数原样透传
 ```
 
-```
-  ag Agent Gateway  32/32 · 选一个 agent · 输入即筛选
-  ❯ ce█
-  ────────────────────────────────────────────────────────────
-  ● ot-ceo        OpenClaw · ceo 内容策划          内容策划
-  ● ot-finance    OpenClaw · finance 社群运营       社群运营
-  ● oc            OpenCode                         开源终端编码 agent
-  ────────────────────────────────────────────────────────────
-  openclaw tui --session agent:ceo:main  tags: openclaw,team
-  ↑↓/Ctrl-P,N 移动 · Enter 启动 · Esc 退出 · Ctrl-U 清空
-```
+上面这段录像是**用真实的渲染器生成的**（不是手搓的假动画），
+所以画面和真跑逐字节一致 —— 见 [`docs/make-demo-cast.py`](docs/make-demo-cast.py)。
+
+> 📖 想一次看全？**[完整使用指南 →](docs/使用指南.md)**（命令全表、选择器按键、
+> 注册表字段、加自定义 agent、排障、FAQ）
 
 ---
 
@@ -239,6 +235,26 @@ bash tests/test_install.sh    # 安装脚本回归测试（临时 HOME，不碰�
 某些 locale 下 bash 会把多字节字符吞进变量名，运行时报 `RAW?: unbound variable`，
 而 **`bash -n` 完全查不出来**。修法一律写成 `${RAW}`。lint 第 1 项就是抓这个。
 
+### 重新生成 README 里的演示
+
+有两种方式：
+
+```bash
+python3 docs/make-demo-cast.py    # 不需要终端，可复现，CI 友好
+bash docs/record-demo.sh          # 开真 asciinema 会话，你亲手敲
+```
+
+第一种拿 `ag` 真正的渲染器跑一遍，把每帧输出连时间戳录成
+[asciinema cast](https://docs.asciinema.org/manual/asciicast/v2/)，
+所以**画面和真实运行逐字节一致**，而且不需要 pty、不需要人操作。
+第二种适合录进自己的真实环境。
+
+两种都产出 `.cast`，再转 GIF：
+
+```bash
+agg --font-size 15 --theme monokai docs/demo.cast docs/demo.gif
+```
+
 ---
 
 ## 文件
@@ -248,6 +264,11 @@ ag                       主程序（Python 标准库，零依赖）
 registry.example.toml    注册表模板，install.sh 会复制成 ~/.agents/registry.toml
 ag.zsh                   zsh 补全 + Ctrl-G 快捷键
 install.sh               安装脚本（幂等，支持 curl | bash）
+docs/使用指南.md          完整使用手册
+docs/demo.cast           演示录像（asciinema 格式）
+docs/demo.gif            README 里那张图
+docs/make-demo-cast.py   从真实渲染器生成录像
+docs/record-demo.sh      开真终端录一段
 tests/lint.sh            静态检查
 tests/test_ag.py         主程序回归测试
 tests/test_install.sh    安装脚本回归测试
