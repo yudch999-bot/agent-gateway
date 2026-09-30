@@ -191,8 +191,76 @@ check("往返无损", (back.id, back.name, back.args, back.desc, back.tags,
                    e.env, e.cwd, e.install))
 
 say()
-say("7) 注册表完整性")
-ag.shutil = _real_shutil          # 用真的 which()，别被假终端骗了
+say("7) ag rm —— 单条 / 多条 / 保留注释 / 报错")
+ag.shutil = _real_shutil          # rm 要真 shutil（备份用 copy2），别再喂假的
+import tempfile
+FIXTURE = """# 顶部注释，不能被删
+
+# ---------- A 组 ----------
+[[agent]]
+id = "aa"
+name = "甲"
+cmd = "echo"
+desc = "第一个"
+alias = ["a1"]
+tags = ["grp"]
+
+# ---------- B 组 ----------
+[[agent]]
+id = "bb"
+name = "乙"
+cmd = "echo"
+desc = "第二个"
+
+# ---------- C 组 ----------
+[[agent]]
+id = "cc"
+name = "丙"
+cmd = "echo"
+desc = "第三个"
+
+# 文件结尾注释
+"""
+
+def rm_case(args, label):
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False,
+                                     encoding="utf-8") as f:
+        f.write(FIXTURE)
+        path = f.name
+    saved_reg, saved_out, saved_err = ag.REGISTRY, ag.sys.stdout, ag.sys.stderr
+    ag.REGISTRY, ag.sys.stdout, ag.sys.stderr = path, io.StringIO(), io.StringIO()
+    try:
+        rc = ag.main(["ag", "rm", *args])
+    finally:
+        ag.REGISTRY, ag.sys.stdout, ag.sys.stderr = saved_reg, saved_out, saved_err
+    text = open(path, encoding="utf-8").read()
+    return rc, text, path
+
+rc, text, p1 = rm_case(["aa"], "单条")
+ids = [x.id for x in ag.load_registry(p1)]
+check("单条删除成功", rc == 0 and ids == ["bb", "cc"], str(ids))
+check("保留了别的块的小标题", "# ---------- B 组 ----------" in text and
+                              "# ---------- C 组 ----------" in text)
+check("保留了顶部和结尾注释", "顶部注释" in text and "文件结尾注释" in text)
+
+rc, text, p2 = rm_case(["aa", "cc"], "多条")
+ids = [x.id for x in ag.load_registry(p2)]
+check("一次删多条", rc == 0 and ids == ["bb"], str(ids))
+check("多条删除后注释仍在", "# ---------- B 组 ----------" in text)
+
+rc, text, p3 = rm_case(["a1"], "用别名删")
+ids = [x.id for x in ag.load_registry(p3)]
+check("别名也能删", rc == 0 and ids == ["bb", "cc"], str(ids))
+
+rc, text, p4 = rm_case(["aa", "nope"], "有找不到的")
+ids = [x.id for x in ag.load_registry(p4)]
+check("有一个找不到就整体不删", rc != 0 and ids == ["aa", "bb", "cc"], str(ids))
+
+for f in (p1, p2, p3, p4):
+    os.unlink(f)
+
+say()
+say("8) 注册表完整性")
 reg = ag.load_registry()
 ids = [x.id for x in reg]
 check("id 无重复", len(ids) == len(set(ids)))

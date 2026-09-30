@@ -97,7 +97,10 @@ class Entry:
         return [self.cmd, *self.args, *(extra or [])]
 
 
-def load_registry(path=REGISTRY):
+def load_registry(path=None):
+    # 注意别写成 path=REGISTRY：默认参数在「函数定义时」就绑定死了，
+    # 之后改 ag.REGISTRY（比如测试里指向临时文件）它不会跟。
+    path = path or REGISTRY
     if not os.path.exists(path):
         return []
     with open(path, "rb") as f:
@@ -564,21 +567,33 @@ def backup_registry():
 
 
 def cmd_rm(entries, args):
-    """按 [[agent]] 块整块删除，保留文件里的注释和别人手写的格式。"""
-    if not args:
-        return die("用法：ag rm <id>")
-    target = find_entry(entries, args[0])
-    if not target:
-        return die(f"注册表里没有 「{args[0]}」")
+    """按 [[agent]] 块整块删除，保留文件里的注释和别人手写的格式。
 
-    names = {a.lower() for a in target.all_ids}
+    支持一次删多个：  ag rm hpw hpt hpc
+    """
+    if not args:
+        return die("用法：ag rm <id> [id...]")
+
+    targets, missing = [], []
+    for a in args:
+        e = find_entry(entries, a)
+        if e is None:
+            missing.append(a)
+        elif e.id not in [t.id for t in targets]:
+            targets.append(e)
+    if missing:
+        return die("注册表里没有：" + "、".join("「%s」" % m for m in missing))
+
+    names = set()
+    for t in targets:
+        names.update(x.lower() for x in t.all_ids)
+
     with open(REGISTRY, encoding="utf-8") as f:
         lines = f.readlines()
 
-    out, block, dropped = [], [], 0
+    out, block, dropped = [], [], []
 
     def flush():
-        nonlocal dropped
         if not block:
             return
         # 块尾的注释/空行其实是下一节的小标题，先摘出来，别跟着被删
@@ -586,19 +601,19 @@ def cmd_rm(entries, args):
         while len(block) > 1 and (not block[-1].strip()
                                   or block[-1].lstrip().startswith("#")):
             tail.insert(0, block.pop())
-        hit = False
+        hit = None
         for ln in block:
             s = ln.strip()
             if s.startswith("id") and "=" in s:
-                val = s.split("=", 1)[1].strip().strip('"\'')
+                val = s.split("=", 1)[1].strip().strip("\"\'")
                 if val.lower() in names:
-                    hit = True
+                    hit = val
             if s.startswith("alias") and "=" in s:
                 for tok in s.split("=", 1)[1].strip().strip("[]").split(","):
-                    if tok.strip().strip('"\' ').lower() in names:
-                        hit = True
+                    if tok.strip().strip("\"\' ").lower() in names:
+                        hit = hit or tok.strip().strip("\"\' ")
         if hit:
-            dropped += 1
+            dropped.append(hit)
         else:
             out.extend(block)
         out.extend(tail)
@@ -614,15 +629,16 @@ def cmd_rm(entries, args):
     flush()
 
     if not dropped:
-        return die(f"没找到 {target.id} 的块，注册表可能被手改过；用 ag edit 看看")
+        return die("没找到对应的块，注册表可能被手改过；用 ag edit 看看")
     if not any(x.strip().startswith("[[agent]]") for x in out):
         out.append("\n# （空）用 `ag add` 加一个吧\n")
 
     bk = backup_registry()
     with open(REGISTRY, "w", encoding="utf-8") as f:
         f.writelines(out)
-    print(f"  {C['grn']}✓ 已删除{C['r']} {C['b']}{target.id}{C['r']}"
-          f"  {C['gry']}({dropped} 块，注释已保留){C['r']}")
+
+    print(f"  {C['grn']}✓ 已删除 {len(dropped)} 条{C['r']}："
+          f"{C['b']}{'、'.join(dropped)}{C['r']}  {C['gry']}(注释已保留){C['r']}")
     print(f"  {C['gry']}备份：{bk}{C['r']}")
     return 0
 
@@ -720,7 +736,7 @@ def usage():
     ag ls --json          机器可读，方便接别的脚本
     ag add                向导式添加新 agent
     ag add --id x --cmd y --desc "..." --tags a,b --install "..."
-    ag rm <id>            删除
+    ag rm <id> [id...]   删除（可一次删多条，注释保留）
     ag edit               用 $EDITOR 打开注册表
     ag scan               扫描 PATH，发现装了但没登记的 agent
     ag doctor             体检：哪些能跑、哪些缺
