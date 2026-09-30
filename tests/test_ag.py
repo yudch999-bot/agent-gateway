@@ -777,6 +777,116 @@ finally:
     ag.launch_many = _real_launch_many
 
 say()
+say("18) ag ps / ag kill（假 tmux）")
+
+class FakeTmux:
+    """一个能记事的假 tmux：列表可读，kill 会真的从列表里删掉。"""
+    DEVNULL = -3
+    class SubprocessError(Exception): pass
+
+    def __init__(self):
+        self.sessions = {"ag": 3, "work": 1}
+        self.windows = [
+            ["ag", "0", "cc", "0", "claude", "0", "1800000000", "@1"],
+            ["ag", "1", "oc", "1", "opencode", "0", "1800000100", "@2"],
+            ["ag", "2", "goose", "0", "goose", "0", "1800000200", "@3"],
+            ["work", "0", "vim", "1", "vim", "0", "1800000300", "@4"],
+        ]
+        self.calls = []
+
+    def run(self, argv, **kw):
+        self.calls.append(list(argv))
+        cmd = argv[1] if len(argv) > 1 else ""
+        if cmd == "list-sessions":
+            body = "".join(f"{n}\t{c}\t1800000000\t0\n"
+                           for n, c in self.sessions.items())
+            return types.SimpleNamespace(returncode=0, stdout=body, stderr="")
+        if cmd == "list-windows":
+            tgt = argv[argv.index("-t") + 1] if "-t" in argv else None
+            rows = [w for w in self.windows if tgt is None or w[0] == tgt]
+            return types.SimpleNamespace(
+                returncode=0 if rows else 1,
+                stdout="".join("\t".join(w) + "\n" for w in rows), stderr="")
+        if cmd == "kill-window":
+            t = argv[argv.index("-t") + 1]
+            sess, _, idx = t.rpartition(":")
+            before = len(self.windows)
+            self.windows = [w for w in self.windows
+                            if not (w[0] == sess and w[1] == idx)]
+            if len(self.windows) == before:
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr="can't find window")
+            if not any(w[0] == sess for w in self.windows):
+                self.sessions.pop(sess, None)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd == "kill-session":
+            t = argv[argv.index("-t") + 1]
+            if t not in self.sessions:
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr="can't find session")
+            self.sessions.pop(t)
+            self.windows = [w for w in self.windows if w[0] != t]
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+fake = FakeTmux()
+saved_shutil, saved_sub = ag.shutil, ag.subprocess
+saved_tmux_env = os.environ.pop("TMUX", None)
+ag.shutil = types.SimpleNamespace(
+    which=lambda c: "/usr/local/bin/tmux" if c == "tmux" else None,
+    get_terminal_size=lambda d=(100, 24): os.terminal_size((100, 28)))
+ag.subprocess = fake
+try:
+    rc, o = runcmd(["ps"])
+    check("ag ps 列出正在跑的", rc == 0 and "cc" in o and "goose" in o, o[:200])
+    check("ag ps 认得出不认识的窗口", "vim" in o, o[:300])
+    check("不在 tmux 里时不乱标「你在这」", "你在这" not in o, o[:300])
+
+    rc, o = runcmd(["kill", "cc"])
+    check("关掉单个窗口", rc == 0 and "关掉 1 个" in o, o[:150])
+    check("cc 真的从列表里没了",
+          not any(w[2] == "cc" for w in fake.windows), str(fake.windows))
+    check("别的窗口没被误伤", any(w[2] == "oc" for w in fake.windows))
+
+    rc, o = runcmd(["kill", "nosuch"])
+    check("关不存在的会报错并提示 ag ps", rc != 0 and "ag ps" in o, o[:200])
+
+    rc, o = runcmd(["kill", "oc", "goose"])
+    check("一次关多个", rc == 0 and "关掉 2 个" in o, o[:150])
+    check("窗口关光了会话自己也收了", "ag" not in fake.sessions, str(fake.sessions))
+    check("跟用户说了会话收了", "自己也收了" in o, o[:200])
+
+    fake.sessions.update({"ag": 2, "work": 1})
+    fake.windows += [["ag", "0", "cc", "0", "claude", "0", "1800000000", "@9"],
+                     ["ag", "1", "oc", "0", "opencode", "0", "1800000001", "@10"],
+                     ["work", "0", "vim", "1", "vim", "0", "1800000002", "@11"]]
+    rc, o = runcmd(["kill", "--all", "--session=work", "--force"])
+    check("--all 关掉指定会话", rc == 0 and "work" not in fake.sessions, str(fake.sessions))
+    check("--all 没误伤别的会话", "ag" in fake.sessions, str(fake.sessions))
+
+    rc, o, e = runcmd_err(["kill", "--all", "--session=nosuch", "--force"])
+    check("--all 指定不存在的会话时明确报错",
+          rc != 0 and "没有叫" in e, (o + e)[:200])
+
+    fake.sessions.clear(); fake.windows = []
+    rc, o, e = runcmd_err(["kill", "cc", "--session=nosuch"])
+    check("一条会话都没有时点名也要明确报错",
+          rc != 0 and "不存在" in e, (o + e)[:200])
+    fake.sessions["ag"] = 1
+    fake.windows = [["ag", "0", "cc", "0", "claude", "0", "1800000000", "@1"]]
+
+    # 全没了的时候要友好，不能崩
+    fake.sessions.clear(); fake.windows = []
+    rc, o = runcmd(["ps"])
+    check("一个会话都没有时 ps 不崩", rc == 0 and "没有 tmux 会话" in o, o[:150])
+    rc, o = runcmd(["kill", "cc"])
+    check("一个会话都没有时 kill 不崩", rc == 0 and "没什么可关" in o, o[:150])
+finally:
+    ag.shutil, ag.subprocess = saved_shutil, saved_sub
+    if saved_tmux_env is not None:
+        os.environ["TMUX"] = saved_tmux_env
+
+say()
 say("=" * 64)
 if fail:
     say(f"❌ {len(fail)} 项失败： {fail}")

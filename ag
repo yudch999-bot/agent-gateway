@@ -54,7 +54,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -680,6 +680,294 @@ def cmd_attach(entries, args):
     if os.environ.get("TMUX"):
         return subprocess.run([tmux, "switch-client", "-t", sess]).returncode
     os.execvp(tmux, [tmux, "attach", "-t", sess])
+
+
+# ---------------------------------------------------------------- 看 / 关
+
+# tmux 的 -F 格式串。用 \t 分隔，名字里就算有空格也不会串列。
+_WIN_FMT = "\t".join([
+    "#{session_name}", "#{window_index}", "#{window_name}", "#{window_active}",
+    "#{pane_current_command}", "#{pane_dead}", "#{window_activity}",
+    "#{window_id}",
+])
+
+
+def tmux_sessions():
+    """-> [(会话名, 窗口数, 创建时间, 是否attached)]；没 server 就返回 []。"""
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return []
+    try:
+        r = subprocess.run([tmux, "list-sessions", "-F",
+                            "#{session_name}\t#{session_windows}\t"
+                            "#{session_created}\t#{session_attached}"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []                      # no server running 之类的，正常
+    out = []
+    for ln in r.stdout.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 4:
+            out.append(parts[:4])
+    return out
+
+
+def tmux_windows(session=None):
+    """-> [{session,index,name,active,cmd,dead,activity}]"""
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return []
+    target = session or ""
+    cmd = [tmux, "list-windows"] + (["-t", target] if target else []) + ["-F", _WIN_FMT]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    out = []
+    for ln in r.stdout.splitlines():
+        p_ = ln.split("\t")
+        if len(p_) < 8:
+            continue
+        out.append({
+            "session": p_[0], "index": p_[1], "name": p_[2],
+            "active": p_[3] == "1", "cmd": p_[4],
+            "dead": p_[5] == "1", "activity": p_[6], "wid": p_[7],
+        })
+    return out
+
+
+def current_tmux_window():
+    """我正待着的那个窗口的 id；不在 tmux 里返回 None。"""
+    if not os.environ.get("TMUX"):
+        return None
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return None
+    try:
+        r = subprocess.run([tmux, "display-message", "-p", "#{window_id}"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _win_target(w):
+    return f"{w['session']}:{w['index']}"
+
+
+def _fmt_activity(ts):
+    try:
+        return human_age(int(ts))
+    except (ValueError, TypeError):
+        return "?"
+
+
+def cmd_ps(entries, args):
+    """看现在有哪些 agent 在跑。"""
+    sessions = tmux_sessions()
+    if not sessions:
+        tmux = shutil.which("tmux")
+        if not tmux:
+            return die("没装 tmux，没有可看的会话")
+        print(f"\n  {C['gry']}当前没有 tmux 会话在跑。{C['r']}"
+              f"{C['gry']}开几个：{C['cyn']}ag team{C['r']}\n")
+        return 0
+
+    wins = tmux_windows()
+    known = {e.id: e for e in entries}
+    my_win = current_tmux_window()
+    running = [w for w in wins if w["name"] in known and not w["dead"]]
+    other = [w for w in wins if not (w["name"] in known and not w["dead"])]
+
+    print(f"\n  {C['b']}正在跑的 agent{C['r']}"
+          f"  {C['gry']}{len(running)} 个 · {len(sessions)} 个 tmux 会话{C['r']}\n")
+
+    if not running:
+        print(f"  {C['gry']}没有。开几个：{C['cyn']}ag team{C['r']}\n")
+    else:
+        nw = max([vis_len(w["name"]) for w in running] + [6])
+        for w in running:
+            e = known[w["name"]]
+            here = (f" {C['cyn']}← 你在这{C['r']}"
+                    if my_win and w.get("wid") == my_win else "")
+            att = next((s for s in sessions if s[0] == w["session"]), None)
+            attached = att and att[3] != "0"
+            sess_tag = (f"{C['grn']}{w['session']}{C['r']}" if attached
+                        else f"{C['gry']}{w['session']}{C['r']}")
+            print(f"  {C['grn']}●{C['r']} {sess_tag}{C['gry']}:{w['index']}{C['r']}  "
+                  f"{C['b']}{pad(w['name'], nw)}{C['r']}  "
+                  f"{C['gry']}{pad(trunc(e.name, 22), 22)}{C['r']}  "
+                  f"{C['gry']}{_fmt_activity(w['activity'])}{C['r']}{here}")
+
+    if other:
+        print(f"\n  {C['gry']}其它窗口（不认识的）{C['r']}")
+        for w in other[:10]:
+            print(f"  {C['gry']}○ {w['session']}:{w['index']}  "
+                  f"{pad(w['name'], 16)} {trunc(w['cmd'], 20)}{C['r']}")
+
+    if running:
+        print(f"\n  {C['gry']}关掉某个：{C['cyn']}ag kill {' '.join(w['name'] for w in running[:3])}"
+              f"{C['r']}")
+        print(f"  {C['gry']}全关：{C['cyn']}ag kill --all{C['r']}"
+              f"{C['gry']}　　回到某个会话：{C['cyn']}ag attach{C['r']}")
+    print()
+    return 0
+
+
+def cmd_kill(entries, args):
+    """关掉跑着的 agent 窗口。
+
+        ag kill                列出让你挑（回车取消）
+        ag kill cc oc          关掉指定的
+        ag kill --all          关掉整个会话
+        ag kill --dead         只清理已经退出的
+        ag kill -s <会话名>     指定会话
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return die("没装 tmux，没有可关的会话")
+
+    session = None
+    for i, a in enumerate(args):
+        if a in ("-s", "--session") and i + 1 < len(args):
+            session = args[i + 1]
+        elif a.startswith("--session="):
+            session = a.split("=", 1)[1]
+
+    sessions = tmux_sessions()
+    # 显式点了名就先查名字 —— 免得报「没什么可关的」让人以为一切正常
+    if session and session not in {x[0] for x in sessions}:
+        if not sessions:
+            return die(f"现在没有 tmux 会话在跑（你点名的 {session} 也不存在）")
+        return die(f"没有叫 「{session}」 的 tmux 会话。"
+                   f"现有的：{', '.join(x[0] for x in sessions)}")
+    if not sessions:
+        print(f"\n  {C['gry']}现在没有 tmux 会话在跑，没什么可关的{C['r']}\n")
+        return 0
+
+    wins = tmux_windows(session)
+    known = {e.id: e for e in entries}
+    kill_all = "--all" in args or "-a" in args
+    dead_only = "--dead" in args or "-d" in args
+    force = "--force" in args or "-f" in args
+    ids = [a for a in args if not a.startswith("-")
+           and a not in (session,)]
+
+    # --all：整个会话端掉
+    if kill_all:
+        targets = [session] if session else sorted({x[0] for x in sessions})
+        print(f"\n  {C['yel']}!{C['r']} 要关掉 {len(targets)} 个 tmux 会话："
+              f"{', '.join(targets)}")
+        print(f"  {C['gry']}里面的 agent 会一起没，没保存的东西就没了{C['r']}")
+        if sys.stdin.isatty() and not force:
+            try:
+                if input(f"  确认？[y/N] ").strip().lower() not in ("y", "yes"):
+                    print(f"  {C['gry']}已取消{C['r']}\n")
+                    return 0
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+        ok = 0
+        for t in targets:
+            if subprocess.run([tmux, "kill-session", "-t", t],
+                              capture_output=True).returncode == 0:
+                ok += 1
+        print(f"  {C['grn']}✓ 关掉 {ok}/{len(targets)} 个会话{C['r']}\n")
+        return 0 if ok else 1
+
+    # 挑目标窗口
+    if dead_only:
+        targets = [w for w in wins if w["dead"]]
+    elif ids:
+        targets, missing = [], []
+        for a in ids:
+            e = find_entry(entries, a)
+            key = e.id if e else a
+            hit = [w for w in wins if w["name"] == key]
+            if hit:
+                targets.extend(hit)
+            else:
+                missing.append(a)
+        if missing:
+            print(f"  {C['yel']}!{C['r']} 没找到在跑的：{', '.join(missing)}")
+        if not targets:
+            print(f"  {C['gry']}试试 {C['cyn']}ag ps{C['r']}{C['gry']} 看现在有什么{C['r']}\n")
+            return 1
+    else:
+        running = [w for w in wins if w["name"] in known or not w["dead"]]
+        if not running:
+            print(f"\n  {C['gry']}没有可关的窗口{C['r']}\n")
+            return 0
+        if not sys.stdin.isatty():
+            print(f"\n  {C['gry']}非交互环境要指明对象："
+                  f"{C['cyn']}ag kill <id...>{C['r']} 或 "
+                  f"{C['cyn']}ag kill --all{C['r']}\n")
+            return 1
+        print(f"\n  {C['b']}现在跑着这些：{C['r']}\n")
+        for i, w in enumerate(running, 1):
+            e = known.get(w["name"])
+            nm = e.name if e else w["cmd"]
+            print(f"    {C['b']}{i:>2}{C['r']}  {C['gry']}{w['session']}:{w['index']}{C['r']}  "
+                  f"{C['b']}{pad(w['name'], 14)}{C['r']} {C['gry']}{trunc(nm, 30)}{C['r']}")
+        print(f"\n    {C['b']}a{C['r']}  全部")
+        try:
+            ans = input(f"\n  关掉哪些？（编号，逗号分隔；回车取消） ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not ans:
+            print(f"  {C['gry']}已取消{C['r']}\n")
+            return 0
+        if ans in ("a", "all", "*"):
+            targets = running
+        else:
+            targets = []
+            for tok in ans.replace("，", ",").split(","):
+                tok = tok.strip()
+                if tok.isdigit() and 1 <= int(tok) <= len(running):
+                    targets.append(running[int(tok) - 1])
+
+    if not targets:
+        print(f"  {C['gry']}没选中任何窗口{C['r']}\n")
+        return 0
+
+    # 别把用户正待着的那个窗口默默关掉
+    my_win = current_tmux_window()
+    here = [w for w in targets if my_win and w.get("wid") == my_win]
+    if here and not force:
+        print(f"\n  {C['yel']}!{C['r']} 你要关的 {here[0]['name']} 就是你当前这个窗口，"
+              f"关掉会直接掉出去")
+        if not sys.stdin.isatty() or input(f"  确认？[y/N] ").strip().lower() \
+                not in ("y", "yes"):
+            print(f"  {C['gry']}已取消。真要走就 {C['cyn']}ag kill "
+                  f"{here[0]['name']} --force{C['r']}\n")
+            return 0
+
+    touched = {w["session"] for w in targets}
+    ok, bad = [], []
+    for w in targets:
+        r = subprocess.run([tmux, "kill-window", "-t", _win_target(w)],
+                           capture_output=True, text=True)
+        (ok if r.returncode == 0 else bad).append(w["name"])
+        if r.returncode != 0 and r.stderr.strip():
+            print(f"    {C['red']}{trunc(r.stderr.strip(), 70)}{C['r']}")
+
+    print(f"\n  {C['grn']}✓ 关掉 {len(ok)} 个{C['r']}"
+          + (f"：{C['b']}{', '.join(ok)}{C['r']}" if ok else ""))
+    if bad:
+        print(f"  {C['red']}✗ {len(bad)} 个没关成：{', '.join(bad)}{C['r']}")
+
+    # 窗口全关掉，tmux 会话自己就结束了
+    left = {x[0] for x in tmux_sessions()}
+    gone = [t for t in touched if t not in left]
+    if gone:
+        print(f"  {C['gry']}会话 {', '.join(gone)} 里没窗口了，tmux 自己也收了{C['r']}")
+    print()
+    return 0 if not bad else 1
 
 
 # ---------------------------------------------------------------- 模糊选择器
@@ -2160,6 +2448,10 @@ def usage():
     ag team --panes cc oc 用分屏（同屏都能看见）
     ag team -r cc oc      都续聊上次的会话
     ag attach             回到之前的 tmux 会话
+    ag ps                 看现在有哪些 agent 在跑
+    ag kill [id...]       关掉指定的窗口（不带参数会列出让你挑）
+    ag kill --all         关掉整个 tmux 会话
+    ag kill --dead        只清理已经退出的窗口
 
   {C['b']}接着上次干{C['r']}
     ag last               接着上次那个 agent、上次那个会话继续
@@ -2230,7 +2522,8 @@ def main(argv):
            "outdated": cmd_outdated, "old": cmd_outdated,
            "search": cmd_search, "find": cmd_search, "s": cmd_search,
            "handoff": cmd_handoff, "ho": cmd_handoff,
-           "team": cmd_team, "multi": cmd_team, "attach": cmd_attach}
+           "team": cmd_team, "multi": cmd_team, "attach": cmd_attach,
+           "ps": cmd_ps, "kill": cmd_kill, "stop": cmd_kill}
 
     if a and a[0] in sub:
         return sub[a[0]](entries, a[1:])

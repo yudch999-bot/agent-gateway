@@ -100,6 +100,9 @@ cd agent-gateway
 | `ag team cc oc goose` | 直接点名几个 |
 | `ag team --panes cc oc` | 用分屏（同屏都能看见） |
 | `ag attach` | 回到之前的 tmux 会话 |
+| **`ag ps`** | **看现在有哪些 agent 在跑** |
+| **`ag kill [id...]`** | **关掉指定的窗口**（不带参数会列出让你挑） |
+| `ag kill --all` | 关掉整个 tmux 会话 |
 
 ### 选择器
 
@@ -211,6 +214,27 @@ ag attach       # 随时回来
 ```
 
 没装 tmux 也不会死：macOS 会退化成开几个 Terminal 窗口，其它平台把命令打出来。
+
+### 收尾
+
+```bash
+ag ps              # 现在跑着什么
+ag kill            # 列出让你挑（回车取消）
+ag kill cc oc      # 关掉指定的
+ag kill --all      # 关掉整个会话
+```
+
+```
+  正在跑的 agent  3 个 · 1 个 tmux 会话
+
+  ● ag:0  cc       Claude Code             4 分钟前
+  ● ag:1  oc       OpenCode                1 分钟前  ← 你在这
+  ● ag:2  goose    Goose                   3 分钟前
+```
+
+不认识的窗口也会列出来（比如你自己开的 vim），不会假装没看见。
+`ag kill` 不带参数时**回车就是取消**；要关的如果正是你待着的窗口会先问一次；
+窗口关光了 tmux 会话自己结束，`ag` 会告诉你一声。
 
 > 想看会执行什么：`ag team --dry-run cc oc`
 
