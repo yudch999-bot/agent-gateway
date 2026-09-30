@@ -213,16 +213,27 @@ export AG_NO_KEYBIND=1
 
 ## 开发
 
-主程序是单文件 `ag`（Python，标准库）。改完跑一遍回归测试：
+主程序是单文件 `ag`（Python 标准库，无第三方依赖）。改完跑全套：
 
 ```bash
-python3 tests/test_ag.py
+bash tests/lint.sh            # 静态检查
+python3 tests/test_ag.py      # 主程序回归测试
+bash tests/test_install.sh    # 安装脚本回归测试（临时 HOME，不碰真环境）
 ```
 
-测试用假终端驱动选择器（不需要真 pty），覆盖渲染帧、终端还原、按键导航、
-中英文与标签搜索排序、别名解析、TOML 特殊字符往返、注册表完整性。
+| 测试 | 覆盖什么 |
+|---|---|
+| `tests/lint.sh` | `$VAR` 后紧跟多字节字符、shell 语法、可执行位、密钥扫描、shellcheck |
+| `tests/test_ag.py` | 假终端驱动选择器（**不需要真 pty**）：渲染帧、终端还原、按键导航、中英文与标签搜索排序、别名解析、TOML 特殊字符往返、注册表完整性 |
+| `tests/test_install.sh` | 全新 HOME 安装、重复安装幂等、老式标记行识别、已有注册表不被覆盖 |
 
-本机装齐了的可以加 `AG_EXPECT_ALL_INSTALLED=1` 让它额外校验每个可执行文件都能解析到。
+本机装齐了全套 agent 的，可以加 `AG_EXPECT_ALL_INSTALLED=1` 让它额外校验每个可执行文件都解析得到。
+
+### 为什么有 `lint.sh` 第 1 项
+
+这个项目真踩过：`"源文件：$RAW（远程下载）"` 里 `$RAW` 后面紧跟全角括号 `（`，
+某些 locale 下 bash 会把多字节字符吞进变量名，运行时报 `RAW?: unbound variable`，
+而 **`bash -n` 完全查不出来**。修法一律写成 `${RAW}`。lint 第 1 项就是抓这个。
 
 ---
 
@@ -232,8 +243,10 @@ python3 tests/test_ag.py
 ag                       主程序（Python 标准库，零依赖）
 registry.example.toml    注册表模板，install.sh 会复制成 ~/.agents/registry.toml
 ag.zsh                   zsh 补全 + Ctrl-G 快捷键
-tests/test_ag.py         回归测试
-install.sh              安装脚本
+install.sh               安装脚本（幂等，支持 curl | bash）
+tests/lint.sh            静态检查
+tests/test_ag.py         主程序回归测试
+tests/test_install.sh    安装脚本回归测试
 ```
 
 运行时目录：

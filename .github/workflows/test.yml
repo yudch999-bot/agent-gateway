@@ -7,6 +7,30 @@ on:
   workflow_dispatch:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 静态检查（含 $VAR 后紧跟多字节字符这个坑）
+        run: bash tests/lint.sh
+
+  install:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装脚本回归测试（临时 HOME，不碰真环境）
+        run: bash tests/test_install.sh
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
