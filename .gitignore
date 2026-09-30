@@ -15,3 +15,6 @@ venv/
 # 本地实测产物：别把带个人短名的注册表提交上去
 registry.toml
 !registry.example.toml
+
+# ag rm / ag add 会在注册表同级建 backups/，仓库里跑测试会留下痕迹
+backups/

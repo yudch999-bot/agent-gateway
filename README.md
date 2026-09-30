@@ -87,7 +87,7 @@ cd agent-gateway
 ### 选择器
 
 ```
-  ag Agent Gateway  32/32 · 选一个 agent · 输入即筛选
+  ag Agent Gateway  29/29 · 选一个 agent · 输入即筛选
   ❯ ce█
   ────────────────────────────────────────────────────────────
   ● ot-ceo        OpenClaw · ceo 内容策划          内容策划

@@ -193,29 +193,8 @@ args = ["start"]
 desc = "Hermes 网页界面"
 tags = ["hermes", "web"]
 
-[[agent]]
-id = "hpw"
-name = "Hermes · wechat profile"
-cmd = "hermes"
-args = ["--profile", "wechat"]
-desc = "公众号写作 profile"
-tags = ["hermes", "profile"]
 
-[[agent]]
-id = "hpt"
-name = "Hermes · toutiao profile"
-cmd = "hermes"
-args = ["--profile", "toutiao"]
-desc = "头条运营 profile"
-tags = ["hermes", "profile"]
 
-[[agent]]
-id = "hpc"
-name = "Hermes · coder profile"
-cmd = "hermes"
-args = ["--profile", "coder"]
-desc = "写代码 profile"
-tags = ["hermes", "profile"]
 
 # ---------- 9. Pi ----------
 [[agent]]

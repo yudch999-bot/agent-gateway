@@ -78,7 +78,8 @@ if [ -f "$AG_DIR/registry.toml" ]; then
   fetch registry.example.toml "$AG_DIR/registry.example.toml"
 else
   fetch registry.example.toml "$AG_DIR/registry.toml"
-  c_ok "注册表：$AG_DIR/registry.toml（32 条示例）"
+  n=$(grep -c '^\[\[agent\]\]' "$AG_DIR/registry.toml" 2>/dev/null || echo "?")
+  c_ok "注册表：$AG_DIR/registry.toml（${n} 条示例）"
 fi
 
 # ---------- 5. 装 zsh 集成 ----------
