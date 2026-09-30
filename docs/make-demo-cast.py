@@ -102,10 +102,13 @@ _bufout = _FakeOut()
 ag.sys.stdin = _FakeIn()
 ag.sys.stdout = _bufout
 
-# 让「启动」只打印那一行，不真的 exec
-def _fake_launch(entry, extra):
+# 让「启动」只打印那一行，不真的 exec。
+# 签名要跟 cmd_launch 一致（含 resume 关键字），否则 main() 调用时会炸。
+def _fake_launch(entry, extra, resume=False):
+    tag = " \033[35m↻ 续聊\033[0m" if resume else ""
+    argv = entry.resume_argv(extra) if resume else entry.argv(extra)
     print(f"\033[32m▶\033[0m \033[1m{entry.name}\033[0m "
-          f"\033[90m({entry.id})\033[0m  \033[2m{' '.join(entry.argv(extra))}\033[0m")
+          f"\033[90m({entry.id})\033[0m{tag}  \033[2m{' '.join(argv)}\033[0m")
     sys.stdout.flush()
     return 0
 

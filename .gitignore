@@ -18,3 +18,7 @@ registry.toml
 
 # ag rm / ag add 会在注册表同级建 backups/，仓库里跑测试会留下痕迹
 backups/
+
+# 状态文件跟注册表同级。用 AG_REGISTRY=./registry.example.toml 跑会落在这儿
+usage.jsonl
+pins.json

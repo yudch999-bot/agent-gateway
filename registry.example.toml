@@ -33,6 +33,7 @@ cmd = "dsh-tui"
 desc = "DeepSeek 官方 harness TUI"
 tags = ["deepseek", "official"]
 alias = ["dsh"]
+resume = ["--resume"]
 install = "npm i -g @deepseek-ai/dsh"
 
 [[agent]]
@@ -51,6 +52,7 @@ cmd = "claude"
 desc = "Anthropic 官方 CLI"
 tags = ["anthropic", "official"]
 alias = ["claude"]
+resume = ["--resume"]
 install = "curl -fsSL https://claude.ai/install.sh | bash"
 
 # ---------- 3. Codex ----------
@@ -60,6 +62,7 @@ name = "Codex CLI"
 cmd = "codex"
 desc = "OpenAI 官方 CLI"
 tags = ["openai", "official"]
+resume = ["resume"]
 install = "npm i -g @openai/codex@latest"
 
 # ---------- 4. Gemini CLI ----------
@@ -69,6 +72,7 @@ name = "Gemini CLI"
 cmd = "gemini"
 desc = "Google 官方 CLI"
 tags = ["google", "official"]
+resume = ["--resume"]
 install = "npm i -g @google/gemini-cli@latest"
 
 # ---------- 5. Grok Build ----------
@@ -78,6 +82,7 @@ name = "Grok Build"
 cmd = "grok"
 desc = "xAI Grok 编码 TUI"
 tags = ["xai", "grok"]
+resume = ["--resume"]
 install = "npm i -g @xai-official/grok@latest"
 
 # ---------- 6. OpenCode ----------
@@ -88,6 +93,7 @@ cmd = "opencode"
 desc = "开源终端编码 agent"
 tags = ["opensource", "tui"]
 alias = ["opencode"]
+resume = ["--continue"]
 install = "curl -fsSL https://opencode.ai/install | bash"
 
 # ---------- 7. OpenClaw（主会话 + 8 个专职 session）----------
@@ -175,6 +181,7 @@ cmd = "hermes"
 desc = "NousResearch Hermes agent"
 tags = ["hermes"]
 alias = ["hermes"]
+resume = ["--continue"]
 install = "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
 
 [[agent]]
@@ -184,6 +191,7 @@ cmd = "hermes"
 args = ["--tui"]
 desc = "Hermes 终端界面"
 tags = ["hermes", "tui"]
+resume = ["--continue"]
 
 [[agent]]
 id = "hwu"
@@ -212,6 +220,7 @@ name = "Oh My Pi"
 cmd = "omp"
 desc = "Pi 的增强版"
 tags = ["pi", "omp"]
+resume = ["--resume"]
 install = "curl -fsSL https://omp.sh/install | sh"
 
 # ---------- 11. Prime Agent ----------
@@ -222,6 +231,7 @@ cmd = "prime-agent"
 desc = "PrimeIntellect agent"
 tags = ["prime"]
 alias = ["prime-agent"]
+resume = ["--resume"]
 install = "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
 
 # ---------- 12. JCode ----------
@@ -241,6 +251,7 @@ name = "Kimi Code"
 cmd = "kimi"
 desc = "Moonshot Kimi 编码 CLI"
 tags = ["moonshot", "kimi"]
+resume = ["--session"]
 install = "curl -LsSf https://code.kimi.com/install.sh | bash"
 
 # ---------- 14. Goose ----------
@@ -250,6 +261,7 @@ name = "Goose"
 cmd = "goose"
 desc = "Block/aaif 开源 agent"
 tags = ["goose", "opensource"]
+resume = ["session", "--resume"]
 install = "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash"
 
 # ---------- 15. Oh My Codex ----------
@@ -259,6 +271,7 @@ name = "Oh My Codex"
 cmd = "omx"
 desc = "Codex 增强封装"
 tags = ["codex", "wrapper"]
+resume = ["resume"]
 install = "npm install -g oh-my-codex"
 
 # ---------- 16. Oh My ClaudeCode ----------
@@ -277,6 +290,7 @@ name = "MiniMax Code"
 cmd = "mcode"
 desc = "MiniMax 编码 CLI"
 tags = ["minimax"]
+resume = ["--session"]
 install = "curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash"
 
 # ---------- 18. CodeWhale ----------
@@ -287,4 +301,5 @@ cmd = "codewhale"
 desc = "codewhale.net"
 tags = ["codewhale"]
 alias = ["codewhale"]
+resume = ["resume"]
 install = "curl -fsSL https://codewhale.net/install.sh | sh"

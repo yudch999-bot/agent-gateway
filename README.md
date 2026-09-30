@@ -83,19 +83,20 @@ cd agent-gateway
 | `ag <id>` | 精确启动，例 `ag cc` |
 | `ag <id> [参数...]` | 参数透传给 agent，例 `ag cc --resume` |
 | `ag <关键词>` | 没精确匹配时，打开预填关键词的选择器 |
+| **`ag last`** | **接着上次那个 agent、上次那个会话继续** |
+| `ag last --new` | 同上，但开新会话 |
+| **`ag resume [id]`** | **续聊。不带 id 会列出支持续聊的** |
 
 ### 选择器
 
 ```
-  ag Agent Gateway  29/29 · 选一个 agent · 输入即筛选
-  ❯ ce█
+  ag Agent Gateway  1/29 · 选一个 agent · 输入即筛选
+  ❯ 设
   ────────────────────────────────────────────────────────────
-  ● ot-ceo        OpenClaw · ceo 内容策划          内容策划
-  ● ot-finance    OpenClaw · finance 社群运营       社群运营
-  ● oc            OpenCode                         开源终端编码 agent
+  ● ot-design     OpenClaw · design 视觉设计师     视觉设计师
   ────────────────────────────────────────────────────────────
-  openclaw tui --session agent:ceo:main  tags: openclaw,team
-  ↑↓/Ctrl-P,N 移动 · Enter 启动 · Esc 退出 · Ctrl-U 清空
+  openclaw tui --session agent:design:main  tags: openclaw,team
+  ↑↓ 移动 · Enter 启动 · Ctrl-R 续聊 · Ctrl-T 置顶 · Ctrl-O 配置 · ? 帮助 · Esc 退出
 ```
 
 | 按键 | 作用 |
@@ -104,7 +105,16 @@ cd agent-gateway
 | `↑` `↓` / `Ctrl-P` `Ctrl-N` | 移动 |
 | `PgUp` `PgDn` / `Home` `End` | 翻页 / 跳首尾 |
 | `Backspace` / `Ctrl-U` | 删一字 / 清空 |
-| `Enter` / `Esc` | 启动 / 退出 |
+| `Enter` | 启动（新会话） |
+| **`Ctrl-R`** | **续聊 —— 接上次的会话**（需要注册表里有 `resume`） |
+| `Ctrl-T` | 置顶 / 取消置顶（★ 标记，会排在前面） |
+| `Ctrl-O` | 打开该 agent 的配置目录 |
+| `?` | 帮助面板 |
+| `Esc` / `Ctrl-C` | 退出 |
+
+**排序会学习你的习惯**：空查询时按 *置顶 > 常用程度 > 注册表顺序* 排。
+常用程度 = 用过的次数按 **14 天半衰期** 衰减 —— 常用来的一直在前面，
+偶尔翻出来的老古董会自然沉下去。一打字就切回按命中质量排。
 
 搜索范围：**短名、显示名、说明、标签、别名**，中英文都行。
 
@@ -132,7 +142,60 @@ ag deepseek    →  d
 | `ag install <id>` | 按登记的 `install` 命令安装 |
 | `ag install --missing` | 一键补装所有缺失的 |
 | `ag which <id>` | 看实际会执行什么、在哪 |
+| `ag pin [id...]` | 置顶（不带参数列出当前置顶） |
+| `ag unpin <id...>` | 取消置顶 |
+| `ag stats` | 使用统计（含 frecency 柱状图） |
+| `ag stats --history` | 最近启动的时间线 |
 | `ag path` | 打印注册表路径 |
+
+---
+
+## 接着上次干
+
+启动器只解决了「开哪个」。真正每天在用的痛点是**「接着上次那个活干」**。
+
+```bash
+ag last          # 上次用的哪个 agent、上次那个会话 → 直接续上
+ag resume cc     # 指定续聊 Claude Code
+ag resume        # 不知道续哪个？列出所有支持续聊的
+```
+
+或者在选择器里选中一项按 **`Ctrl-R`**。
+
+各家 agent 的续聊方式完全不一样，`ag` 不自己解析会话文件（格式私有、还会变），
+而是**把命令转过去，让各家自己的会话选择器干活**：
+
+| 短名 | 续聊时执行 |
+|---|---|
+| `cc` | `claude --resume` |
+| `codex` | `codex resume` |
+| `grok` | `grok --resume` |
+| `oc` | `opencode --continue` |
+| `kimi` | `kimi --session` |
+| `goose` | `goose session --resume` |
+| `d` | `dsh-tui --resume` |
+
+在注册表里一行就能给任何 agent 加上：
+
+```toml
+resume = ["--resume"]     # 选项式，如 claude / grok
+resume = ["resume"]       # 子命令式，如 codex / omx
+resume = ["session", "--resume"]   # 更长的，如 goose
+```
+
+示例注册表里 **29 条有 15 条**已经填好了（都实测过 `--help`，不是猜的）。
+没填的按 `Ctrl-R` 会明确提示你去加，而不是默默开个新会话。
+
+`ag stats` 能看你到底在用哪些：
+
+```
+  使用统计   共 137 次启动 · 续聊 41 次 · 用过 6 个 agent
+
+  ★ cc         62 次 ·   2 小时前  ▇▇▇▇▇▇▇▇▇▇▇▇ Claude Code
+    oc         38 次 ·      昨天  ▇▇▇▇▇▇▇ OpenCode
+    goose      21 次 ·    3 天前  ▇▇▇▇ Goose
+    kimi        9 次 ·   2 周前  ▇▇ Kimi Code
+```
 
 ---
 
@@ -167,6 +230,8 @@ alias = ["ma", "mine"]        # 额外别名
 env = { API_KEY = "sk-xxx" }  # 启动时注入的环境变量
 cwd = "~/work"                # 启动目录，支持 ~
 install = "npm i -g myagent"  # 给 `ag install` 用
+update = "npm i -g myagent@latest"   # 给 `ag update` 用（不给就退回 install）
+resume = ["--resume"]         # 续聊参数，给 `ag resume` / Ctrl-R 用
 hidden = false                # true 则不进选择器
 ```
 
@@ -281,7 +346,12 @@ tests/test_install.sh    安装脚本回归测试
 ~/.agents/registry.toml        你的注册表
 ~/.agents/ag.zsh               zsh 集成
 ~/.agents/backups/             注册表自动备份（保留最近 20 份）
+~/.agents/usage.jsonl          使用记录（frecency 用，追加写）
+~/.agents/pins.json            置顶的短名
 ```
+
+后面两个是**状态**不是**配置**，跟注册表同级：换了 `AG_REGISTRY` 它们跟着走。
+`usage.jsonl` 一行一条记录，删掉不影响使用，只是排序会退回注册表顺序。
 
 ---
 

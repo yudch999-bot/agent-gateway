@@ -37,6 +37,8 @@ import termios
 import tty
 import textwrap
 import tomllib
+import json
+import time
 
 # ---------------------------------------------------------------- 常量
 
@@ -45,7 +47,17 @@ AG_DIR = os.path.join(HOME, ".agents")
 # 想用别的注册表（比如给项目单独配一份）： export AG_REGISTRY=/path/to/x.toml
 REGISTRY = os.path.expanduser(os.environ.get("AG_REGISTRY")
                               or os.path.join(AG_DIR, "registry.toml"))
-VERSION = "1.0.0"
+# 状态文件跟注册表放一起，换了 AG_REGISTRY 就整套跟着走
+STATE_DIR = os.path.dirname(REGISTRY)
+USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
+PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
+
+VERSION = "1.1.0"
+
+# frecency：每次使用 +1 分，之后按半衰期衰减。
+# 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
+HALF_LIFE_DAYS = 14.0
+USAGE_MAX_LINES = 20000   # 日志超过这个行数就砍掉最老的一半
 
 if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
     C = dict(r="\033[0m", b="\033[1m", dim="\033[2m",
@@ -56,11 +68,12 @@ else:
     C = {k: "" for k in "r b dim red grn yel blu mag cyn gry inv".split()}
 
 
+
 # ---------------------------------------------------------------- 数据模型
 
 class Entry:
-    __slots__ = ("id", "name", "cmd", "args", "desc", "tags",
-                 "alias", "env", "cwd", "install", "hidden", "raw")
+    __slots__ = ("id", "name", "cmd", "args", "desc", "tags", "alias",
+                 "env", "cwd", "install", "update", "resume", "hidden", "raw")
 
     def __init__(self, d: dict):
         self.raw = d
@@ -74,11 +87,19 @@ class Entry:
         self.env = {str(k): str(v) for k, v in d.get("env", {}).items()}
         self.cwd = str(d.get("cwd", "")).strip()
         self.install = str(d.get("install", "")).strip()
+        self.update = str(d.get("update", "")).strip()
+        # resume 是「继续上次会话」的参数，比如 ["--resume"]、["resume"]。
+        # 缺省不填就表示这个 agent 不支持续聊，ag resume 会明确告诉你。
+        self.resume = [str(a) for a in d.get("resume", [])]
         self.hidden = bool(d.get("hidden", False))
 
     @property
     def all_ids(self):
         return [self.id] + self.alias
+
+    @property
+    def can_resume(self):
+        return bool(self.resume)
 
     def haystack(self) -> str:
         return " ".join([self.id, self.name, self.desc, self.cmd,
@@ -95,6 +116,19 @@ class Entry:
 
     def argv(self, extra=None):
         return [self.cmd, *self.args, *(extra or [])]
+
+    def resume_argv(self, extra=None):
+        return [self.cmd, *self.args, *self.resume, *(extra or [])]
+
+    def config_dir(self):
+        """猜这个 agent 的配置目录，给 Ctrl-O 用。"""
+        home = os.path.expanduser("~")
+        for name in (self.id, self.cmd.split("/")[-1], *self.alias):
+            for cand in (os.path.join(home, "." + name),
+                         os.path.join(home, ".config", name)):
+                if os.path.isdir(cand):
+                    return cand
+        return None
 
 
 def load_registry(path=None):
@@ -158,6 +192,160 @@ def fuzzy(entries, query):
     return hits
 
 
+# ---------------------------------------------------------------- 使用记录
+#
+# usage.jsonl 一行一条：{"t": 1759250000, "id": "cc", "cwd": "/Users/..."}
+# 追加写、不锁、坏行直接跳过 —— 崩了最多丢一条记录，不值得为它做事务。
+
+def record_use(entry_id, cwd=None, resumed=False):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(USAGE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "t": int(time.time()),
+                "id": entry_id,
+                "cwd": cwd or os.getcwd(),
+                "resumed": bool(resumed),
+            }, ensure_ascii=False) + "\n")
+    except OSError:
+        pass          # 记不上就算了，绝不能让记录失败挡住启动
+    _trim_usage()
+
+
+def _trim_usage():
+    """日志太长就砍掉最老的一半，避免无限长。"""
+    try:
+        if os.path.getsize(USAGE) < 2_000_000:
+            return
+        with open(USAGE, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= USAGE_MAX_LINES:
+            return
+        with open(USAGE, "w", encoding="utf-8") as f:
+            f.writelines(lines[len(lines) // 2:])
+    except OSError:
+        pass
+
+
+def load_usage_seq():
+    """按写入顺序返回事件列表。坏行跳过。
+
+    顺序很要紧：同一秒内连开两个 agent 时间戳会一样，
+    光靠时间戳排不出先后，「最近用过的」得看谁写在后面。
+    """
+    out = []
+    if not os.path.exists(USAGE):
+        return out
+    try:
+        with open(USAGE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    out.append({"t": int(r["t"]), "id": str(r["id"]),
+                                "cwd": str(r.get("cwd", "")),
+                                "resumed": bool(r.get("resumed"))})
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        return []
+    return out
+
+
+def load_usage():
+    """-> {id: [时间戳, ...]}，按时间升序。"""
+    out = {}
+    for ev in load_usage_seq():
+        out.setdefault(ev["id"], []).append(ev["t"])
+    return out
+
+
+def frecency(usage, now=None):
+    """每个 agent 一个分数：每次使用 +1，按 14 天半衰期衰减。
+
+    用的多 + 最近用过 → 分高。偶尔翻出来用一次的老古董会自然沉下去。
+    """
+    now = now or time.time()
+    out = {}
+    for eid, stamps in usage.items():
+        s = 0.0
+        for t in stamps:
+            age_days = max(0.0, (now - t) / 86400.0)
+            s += 0.5 ** (age_days / HALF_LIFE_DAYS)
+        out[eid] = s
+    return out
+
+
+def last_used_id():
+    """最近一次用的是哪个 —— 直接取最后一条记录，不看时间戳（同秒会撞车）。"""
+    seq = load_usage_seq()
+    return seq[-1]["id"] if seq else None
+
+
+# ---------------------------------------------------------------- 置顶
+
+def load_pins():
+    if not os.path.exists(PINS):
+        return []
+    try:
+        with open(PINS, encoding="utf-8") as f:
+            data = json.load(f)
+        return [str(x) for x in data] if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_pins(pins):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = PINS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sorted(set(pins)), f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, PINS)
+
+
+def order_hits(hits, usage, pins, query="", entries=None):
+    """给 fuzzy() 的结果排序：命中质量 > 置顶 > frecency > 短名长度。
+
+    空查询时没有「命中质量」可言，就纯按 置顶 > frecency > 注册表原顺序。
+    """
+    frec = frecency(usage)
+    pin_set = set(pins)
+    reg_order = {e.id: i for i, e in enumerate(entries or [])}
+    if not query.strip():
+        return sorted(
+            hits,
+            key=lambda t: (t[0].id not in pin_set,
+                           -frec.get(t[0].id, 0.0),
+                           reg_order.get(t[0].id, 999)),
+        )
+    return sorted(
+        hits,
+        key=lambda t: (t[1],
+                       t[0].id not in pin_set,
+                       -frec.get(t[0].id, 0.0),
+                       len(t[0].id),
+                       t[0].id),
+    )
+
+
+def human_age(ts, now=None):
+    """时间戳 -> 「刚刚 / 3 小时前 / 5 天前」。"""
+    now = now or time.time()
+    d = max(0, int(now - ts))
+    if d < 60:
+        return "刚刚"
+    if d < 3600:
+        return f"{d // 60} 分钟前"
+    if d < 86400:
+        return f"{d // 3600} 小时前"
+    if d < 86400 * 30:
+        return f"{d // 86400} 天前"
+    return f"{d // 86400 // 30} 个月前"
+
+
 # ---------------------------------------------------------------- 工具
 
 def term_width(default=100):
@@ -201,7 +389,7 @@ def die(msg, code=1):
 
 # ---------------------------------------------------------------- 启动
 
-def cmd_launch(e: Entry, extra):
+def cmd_launch(e: Entry, extra, resume=False):
     path = e.resolved()
     if not path:
         print(f"{C['red']}✗ 找不到可执行文件 「{e.cmd}」{C['r']}")
@@ -210,6 +398,13 @@ def cmd_launch(e: Entry, extra):
         else:
             print(f"  用 {C['cyn']}ag edit{C['r']} 检查 registry.toml 里的 cmd 字段")
         return 127
+
+    if resume and not e.can_resume:
+        print(f"{C['yel']}!{C['r']} {C['b']}{e.id}{C['r']} 没登记续聊方式，"
+              f"这次按新会话启动")
+        print(f"  {C['gry']}想支持的话在注册表里加一行，例如：  "
+              f"resume = [\"--resume\"]{C['r']}")
+        resume = False
 
     if e.cwd:
         target = os.path.expanduser(e.cwd)
@@ -220,10 +415,17 @@ def cmd_launch(e: Entry, extra):
 
     env = os.environ.copy()
     env.update(e.env)
-    argv = e.argv(extra)
+    argv = e.resume_argv(extra) if resume else e.argv(extra)
 
+    # 先记账再 exec —— execvpe 一调用这个进程就没了，之后写不了
+    try:
+        record_use(e.id, os.getcwd(), resumed=resume)
+    except Exception:
+        pass
+
+    tag = f" {C['mag']}↻ 续聊{C['r']}" if resume else ""
     print(f"{C['grn']}▶{C['r']} {C['b']}{e.name}{C['r']} "
-          f"{C['gry']}({e.id}){C['r']}  {C['dim']}{' '.join(argv)}{C['r']}")
+          f"{C['gry']}({e.id}){C['r']}{tag}  {C['dim']}{' '.join(argv)}{C['r']}")
     sys.stdout.flush()
 
     try:
@@ -239,9 +441,15 @@ def cmd_launch(e: Entry, extra):
 # ---------------------------------------------------------------- 模糊选择器
 
 def picker(entries, initial="", prompt="选一个 agent"):
-    """全屏模糊选择器。返回选中的 Entry，取消返回 None。"""
+    """全屏模糊选择器。
+
+    返回 (Entry, action)：
+        action = "run"     普通启动
+                 "resume"  续聊（Ctrl-R）
+    取消返回 (None, None)。
+    """
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        return None
+        return None, None
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -251,6 +459,17 @@ def picker(entries, initial="", prompt="选一个 agent"):
         sys.stdout.write("\033[?1049l")   # 退出备用屏幕
         sys.stdout.write("\033[?25h")     # 显示光标
         sys.stdout.flush()
+
+    def enter_alt():
+        tty.setraw(fd)
+        sys.stdout.write("\033[?1049h\033[?25l")
+        sys.stdout.flush()
+
+    def leave_alt():
+        """临时回到普通屏幕跑外部命令（比如 open）。"""
+        sys.stdout.write("\033[?1049l\033[?25h")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     def read_key():
         b = os.read(fd, 1)
@@ -281,6 +500,12 @@ def picker(entries, initial="", prompt="选一个 agent"):
             return "BACKSPACE"
         if b == b"\x03":
             return "ESC"
+        if b == b"\x12":
+            return "RESUME"
+        if b == b"\x0f":
+            return "CONFIG"
+        if b == b"\x14":
+            return "PIN"
         if b == b"\x15":
             return "CLEAR"
         if b == b"\x10":
@@ -302,15 +527,21 @@ def picker(entries, initial="", prompt="选一个 agent"):
     query = initial
     cursor = 0
     visible = [e for e in entries if not e.hidden]
+    usage = load_usage()
+    pins = load_pins()
+    show_help = False
+    flash = ""
     W = term_width()
 
+    idw = max([vis_len(e.id) for e in visible] + [2])
+    namew = min(34, max([vis_len(e.name) for e in visible] + [4]))
+
     try:
-        tty.setraw(fd)
-        sys.stdout.write("\033[?1049h\033[?25l")  # 备用屏幕 + 隐藏光标
-        sys.stdout.flush()
+        enter_alt()
 
         while True:
-            hits = fuzzy(visible, query)
+            hits = order_hits(fuzzy(visible, query), usage, pins,
+                              query=query, entries=visible)
             items = [e for e, _ in hits]
             if cursor >= len(items):
                 cursor = max(0, len(items) - 1)
@@ -320,27 +551,58 @@ def picker(entries, initial="", prompt="选一个 agent"):
             list_h = max(5, H - 6)
             top = max(0, min(cursor - list_h // 2, len(items) - list_h))
 
-            idw = max([vis_len(e.id) for e in visible] + [2])
-            namew = min(34, max([vis_len(e.name) for e in visible] + [4]))
-
             out = ["\033[H\033[2J"]
             out.append(f"  {C['b']}{C['mag']}ag{C['r']} {C['dim']}Agent Gateway{C['r']}"
-                       f"  {C['gry']}{len(items)}/{len(visible)} · {prompt} · 输入即筛选{C['r']}\r\n")
-            out.append(f"  {C['cyn']}❯{C['r']} {C['b']}{query}{C['r']}\033[?25h\033[?25l\r\n")
+                       f"  {C['gry']}{len(items)}/{len(visible)} · {prompt}"
+                       f" · 输入即筛选{C['r']}\r\n")
+
+            if show_help:
+                out.append(render_help(W))
+                sys.stdout.write("".join(out))
+                sys.stdout.flush()
+                k = read_key()
+                if k in ("ESC", "EOF", "?", "ENTER"):
+                    show_help = False
+                    continue
+                if k in ("UP", "DOWN", "PGUP", "PGDN", "HOME", "END"):
+                    continue
+                if k == "BACKSPACE":
+                    query = query[:-1]
+                    cursor = 0
+                    show_help = False
+                    continue
+                if k in ("CLEAR",):
+                    query = ""
+                    cursor = 0
+                    show_help = False
+                    continue
+                show_help = False
+                if k and k not in ("UNK",) and len(k) == 1:
+                    query += k
+                    cursor = 0
+                elif k == "CONFIG":
+                    pass
+                continue
+
+            out.append(f"  {C['cyn']}❯{C['r']} {C['b']}{query}{C['r']}"
+                       f"\033[?25h\033[?25l\r\n")
             out.append(f"  {C['gry']}{'─' * min(W - 4, 96)}{C['r']}\r\n")
 
             if not items:
                 out.append(f"\r\n  {C['yel']}没有匹配的 agent{C['r']}\r\n")
 
+            pin_set = set(pins)
             for i in range(top, min(top + list_h, len(items))):
                 e = items[i]
                 ok = e.resolved() is not None
+                pinned = e.id in pin_set
                 idc = pad(e.id, idw)
                 nmc = pad(trunc(e.name, namew), namew)
                 dsc = trunc(e.desc, max(10, W - idw - namew - 14))
                 # 选中行与非选中行前缀完全一致，只靠反显区分，避免左右跳动
-                dot = "●" if ok else "○"
+                dot = "★" if pinned else ("●" if ok else "○")
                 dotc = C['grn'] if ok else C['red']
+                star = f"{C['mag']}↻{C['r']} " if e.can_resume else "  "
                 if i == cursor:
                     line = (f"{C['inv']}  {dotc}{dot}{C['r']}"
                             f"{C['inv']} {C['b']}{idc}{C['r']}"
@@ -356,28 +618,75 @@ def picker(entries, initial="", prompt="选一个 agent"):
             if items:
                 e = items[cursor]
                 bits = [f"{C['cyn']}{' '.join(e.argv())}{C['r']}"]
+                stamps = usage.get(e.id) or []
+                if stamps:
+                    bits.append(f"{C['gry']}用过 {len(stamps)} 次 · "
+                                f"{human_age(stamps[-1])}{C['r']}")
+                if e.can_resume:
+                    bits.append(f"{C['mag']}Ctrl-R 续聊{C['r']}")
                 if e.tags:
                     bits.append(f"{C['gry']}tags: {','.join(e.tags)}{C['r']}")
-                if e.cwd:
-                    bits.append(f"{C['gry']}cwd: {e.cwd}{C['r']}")
                 if not e.resolved() and e.install:
                     bits.append(f"{C['red']}未安装{C['r']}")
                 out.append("  " + "  ".join(bits) + "\r\n")
             else:
                 out.append("\r\n")
 
-            out.append(f"  {C['gry']}↑↓/Ctrl-P,N 移动 · Enter 启动 · Esc 退出 · "
-                       f"Ctrl-U 清空{C['r']}\r\n")
+            if flash:
+                out.append(f"  {C['yel']}{flash}{C['r']}\r\n")
+                flash = ""
+            else:
+                out.append(f"  {C['gry']}↑↓ 移动 · Enter 启动 · Ctrl-R 续聊 · "
+                           f"Ctrl-T 置顶 · Ctrl-O 配置 · ? 帮助 · Esc 退出{C['r']}\r\n")
 
             sys.stdout.write("".join(out))
             sys.stdout.flush()
 
             k = read_key()
             if k in ("ESC", "EOF"):
-                return None
+                return None, None
             if k == "ENTER":
-                return items[cursor] if items else None
-            if k == "UP":
+                return (items[cursor], "run") if items else (None, None)
+            if k == "RESUME":
+                if not items:
+                    continue
+                e = items[cursor]
+                if e.can_resume:
+                    return e, "resume"
+                flash = f"{e.id} 没登记续聊方式 —— 在注册表里加 resume = [...]"
+            elif k == "PIN":
+                if not items:
+                    continue
+                e = items[cursor]
+                if e.id in pins:
+                    pins.remove(e.id)
+                    flash = f"已取消置顶 {e.id}"
+                else:
+                    pins.append(e.id)
+                    flash = f"已置顶 {e.id}"
+                save_pins(pins)
+            elif k == "CONFIG":
+                if not items:
+                    continue
+                e = items[cursor]
+                d = e.config_dir()
+                if not d:
+                    flash = f"没找到 {e.id} 的配置目录"
+                else:
+                    leave_alt()
+                    opener = (["open", d] if sys.platform == "darwin"
+                              else ["xdg-open", d])
+                    try:
+                        subprocess.run(opener, check=False,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                    except OSError:
+                        pass
+                    enter_alt()
+                    flash = f"已打开 {d}"
+            elif k == "?":
+                show_help = True
+            elif k == "UP":
                 cursor = max(0, cursor - 1)
             elif k == "DOWN":
                 cursor = min(len(items) - 1, cursor + 1)
@@ -400,6 +709,45 @@ def picker(entries, initial="", prompt="选一个 agent"):
                 cursor = 0
     finally:
         restore()
+
+
+def render_help(W):
+    """选择器里的帮助面板。"""
+    rows = [
+        ("", "按键"),
+        ("直接打字", "追加筛选词（支持中文、多关键词空格分隔）"),
+        ("↑ ↓ / Ctrl-P Ctrl-N", "上下移动"),
+        ("PgUp PgDn / Home End", "翻页 / 跳首尾"),
+        ("Backspace", "删一个字符"),
+        ("Ctrl-U", "清空筛选词"),
+        ("Enter", "启动选中项（新会话）"),
+        ("Ctrl-R", "续聊 —— 接上次的会话（需要注册表里有 resume 字段）"),
+        ("Ctrl-T", "置顶 / 取消置顶（★ 标记，会排在前面）"),
+        ("Ctrl-O", "打开该 agent 的配置目录"),
+        ("?", "显示 / 关闭这个帮助"),
+        ("Esc / Ctrl-C", "退出，什么都不启动"),
+        ("", ""),
+        ("", "关于排序"),
+        ("", "空查询时按 置顶 > 常用程度 排；一打字就按命中质量排。"),
+        ("", "常用程度 = 用过的次数按 14 天半衰期衰减，常用来的一直在前面。"),
+        ("", ""),
+        ("", "关于快捷键"),
+        ("", "★ 置顶   ↻ 支持续聊   ● 可用   ○ 没装"),
+    ]
+    out = [f"  {C['gry']}{'─' * min(W - 4, 96)}{C['r']}\r\n"]
+    for k, v in rows:
+        if not k and not v:
+            out.append("\r\n")
+        elif k and not v:
+            out.append(f"  {C['b']}{C['cyn']}{k}{C['r']}\r\n")
+        elif not k:
+            out.append(f"  {C['gry']}{trunc(v, min(W - 6, 92))}{C['r']}\r\n")
+        else:
+            out.append(f"  {C['b']}{pad(k, 22)}{C['r']}{C['gry']}"
+                       f"{trunc(v, max(10, W - 28))}{C['r']}\r\n")
+    out.append(f"  {C['gry']}{'─' * min(W - 4, 96)}{C['r']}\r\n")
+    out.append(f"  {C['gry']}按 ? 或 Esc 回到列表{C['r']}\r\n")
+    return "".join(out)
 
 
 # ---------------------------------------------------------------- 子命令
@@ -450,10 +798,162 @@ def cmd_which(entries, args):
     print(f"  name  : {e.name}")
     print(f"  命令  : {' '.join(e.argv(args[1:]))}")
     print(f"  路径  : {p or C['red'] + '（未安装）' + C['r']}")
+    if e.can_resume:
+        print(f"  续聊  : {' '.join(e.resume_argv(args[1:]))}")
     if e.cwd:
         print(f"  目录  : {e.cwd}")
     if e.env:
         print(f"  环境  : {e.env}")
+    return 0
+
+
+# ---------------------------------------------------------------- 续聊 / 最近
+
+def cmd_resume(entries, args):
+    """续聊：接着上次那个会话继续。
+
+    各家 agent 的续聊方式不一样（claude --resume / codex resume / ...），
+    这里不自己解析会话文件，只把命令转过去，让各家的选择器自己干活。
+    """
+    if args and not args[0].startswith("-"):
+        e = find_entry(entries, args[0])
+        if not e:
+            return die(f"注册表里没有 「{args[0]}」")
+        return cmd_launch(e, args[1:], resume=True)
+
+    cands = [e for e in entries if e.can_resume and not e.hidden]
+    if not cands:
+        print(f"{C['yel']}没有任何 agent 登记了续聊方式。{C['r']}")
+        print(f"  在注册表里给对应条目加一行就行：")
+        print(f"    {C['cyn']}resume = [\"--resume\"]{C['r']}   "
+              f"{C['gry']}# claude / grok 这种选项式{C['r']}")
+        print(f"    {C['cyn']}resume = [\"resume\"]{C['r']}     "
+              f"{C['gry']}# codex / goose 这种子命令式{C['r']}")
+        return 1
+
+    if not sys.stdin.isatty():
+        # 非交互：退回「最近用过的那个」
+        return cmd_last(entries, [])
+
+    e, _ = picker(cands, prompt="续聊哪个？")
+    if e is None:
+        return 0
+    return cmd_launch(e, args, resume=True)
+
+
+def cmd_last(entries, args):
+    """接着上次那个 agent 干。
+
+        ag last          接上次的会话继续（没登记 resume 就开新会话）
+        ag last --new    明确开新会话
+    """
+    extra = [a for a in args if a not in ("--new", "-n")]
+    fresh = ("--new" in args) or ("-n" in args)
+
+    usage = load_usage()
+    lid = last_used_id()
+    if not lid:
+        return die("还没有使用记录。先跑一次 ag <id> 就有了")
+
+    e = find_entry(entries, lid)
+    if not e:
+        return die(f"上次用的是 「{lid}」，但它已经不在注册表里了")
+
+    stamps = usage.get(lid) or []
+    when = human_age(stamps[-1]) if stamps else "?"
+    what = "新会话" if (fresh or not e.can_resume) else "接着上次的会话"
+    print(f"  {C['gry']}上次用的是 {C['b']}{e.id}{C['r']}{C['gry']}"
+          f"（{when}，共 {len(stamps)} 次）→ {what}{C['r']}")
+
+    return cmd_launch(e, extra, resume=not fresh)
+
+
+# ---------------------------------------------------------------- 置顶
+
+def cmd_pin(entries, args, remove=False):
+    pins = load_pins()
+    if not args:
+        if not pins:
+            print(f"  {C['gry']}还没有置顶的。用 {C['cyn']}ag pin <id>{C['r']}"
+                  f"{C['gry']} 加一个{C['r']}")
+            return 0
+        print(f"\n  {C['b']}置顶（选择器里显示 ★，排在前面）{C['r']}\n")
+        for p in pins:
+            e = find_entry(entries, p)
+            name = e.name if e else f"{C['red']}（已不在注册表里）{C['r']}"
+            print(f"  {C['mag']}★{C['r']} {C['b']}{pad(p, 16)}{C['r']} {name}")
+        print()
+        return 0
+
+    changed = []
+    for a in args:
+        e = find_entry(entries, a)
+        if not e:
+            print(f"  {C['yel']}!{C['r']} 跳过 「{a}」：注册表里没有")
+            continue
+        if remove:
+            if e.id in pins:
+                pins.remove(e.id)
+                changed.append(e.id)
+        else:
+            if e.id not in pins:
+                pins.append(e.id)
+                changed.append(e.id)
+    save_pins(pins)
+
+    verb = "取消置顶" if remove else "置顶"
+    if changed:
+        print(f"  {C['grn']}✓ 已{verb} {len(changed)} 条{C['r']}："
+              f"{C['b']}{'、'.join(changed)}{C['r']}")
+    else:
+        print(f"  {C['gry']}没有变化{C['r']}")
+    return 0
+
+
+# ---------------------------------------------------------------- 统计
+
+def cmd_stats(entries, args):
+    """使用统计。 --history 看最近的时间线。"""
+    usage = load_usage()
+    if not usage:
+        print(f"  {C['gry']}还没有使用记录。跑几次 ag 就有了{C['r']}")
+        return 0
+
+    seq = load_usage_seq()
+    total = len(seq)
+    resumed = sum(1 for ev in seq if ev["resumed"])
+
+    if "--history" in args or "-H" in args:
+        print(f"\n  {C['b']}最近的启动{C['r']}  {C['gry']}(共 {total} 次){C['r']}\n")
+        for ev in list(reversed(load_usage_seq()))[:30]:
+            cwd = ev["cwd"]
+            if cwd.startswith(HOME):
+                cwd = "~" + cwd[len(HOME):]
+            mark = f"{C['mag']}↻{C['r']}" if ev["resumed"] else " "
+            print(f"  {mark} {C['gry']}{human_age(ev['t']):>9}{C['r']}  "
+                  f"{C['b']}{pad(ev['id'], 14)}{C['r']} "
+                  f"{C['gry']}{trunc(cwd, 46)}{C['r']}")
+        print()
+        return 0
+
+    frec = frecency(usage)
+    pins = set(load_pins())
+    rows = sorted(usage.items(), key=lambda kv: -len(kv[1]))
+    idw = max([vis_len(k) for k, _ in rows] + [4])
+
+    print(f"\n  {C['b']}使用统计{C['r']}   {C['gry']}共 {total} 次启动 · "
+          f"续聊 {resumed} 次 · 用过 {len(usage)} 个 agent{C['r']}\n")
+    for eid, stamps in rows[:20]:
+        e = find_entry(entries, eid)
+        name = e.name if e else f"{C['red']}(已移除){C['r']}"
+        star = f"{C['mag']}★{C['r']}" if eid in pins else " "
+        bar = "▇" * min(20, max(1, int(round(frec.get(eid, 0)))))
+        print(f"  {star} {C['b']}{pad(eid, idw)}{C['r']} "
+              f"{C['gry']}{len(stamps):>4} 次 · {human_age(stamps[-1]):>9}{C['r']}  "
+              f"{C['cyn']}{bar}{C['r']} {C['gry']}{trunc(name, 24)}{C['r']}")
+    if len(rows) > 20:
+        print(f"  {C['gry']}…还有 {len(rows) - 20} 个{C['r']}")
+    print(f"\n  {C['gry']}时间线：{C['cyn']}ag stats --history{C['r']}\n")
     return 0
 
 
@@ -543,6 +1043,10 @@ def render_toml(e: Entry):
         L.append("env = { " + ", ".join(f"{k} = {toml_str(v)}" for k, v in e.env.items()) + " }")
     if e.install:
         L.append(f"install = {toml_str(e.install)}")
+    if e.update:
+        L.append(f"update = {toml_str(e.update)}")
+    if e.resume:
+        L.append(f"resume = {toml_arr(e.resume)}")
     if e.hidden:
         L.append("hidden = true")
     return "\n".join(L) + "\n"
@@ -728,8 +1232,16 @@ def usage():
   {C['b']}启动{C['r']}
     ag                    打开模糊选择器（输入即筛选，回车启动）
     ag <id>               直接启动，例： ag cc / ag oc / ag ot-ceo
-    ag <id> [参数...]     透传给 agent，例： ag cc --resume
+    ag <id> [参数...]     透传给 agent
     ag <关键词>           没精确匹配时，打开预筛选的选择器
+
+  {C['b']}接着上次干{C['r']}
+    ag last               接着上次那个 agent、上次那个会话继续
+    ag last --new         同上，但开新会话
+    ag resume [id]        续聊。不带 id 会列出支持续聊的
+    ag pin [id...]        置顶（选择器里显示 ★，排在前面）
+    ag unpin <id...>      取消置顶
+    ag stats [--history]  使用统计 / 最近启动时间线
 
   {C['b']}管理{C['r']}
     ag ls [--all]         列出全部（--all 含隐藏项）
@@ -773,7 +1285,11 @@ def main(argv):
 
     sub = {"ls": cmd_ls, "list": cmd_ls, "add": cmd_add, "rm": cmd_rm,
            "remove": cmd_rm, "edit": cmd_edit, "scan": cmd_scan,
-           "doctor": cmd_doctor, "install": cmd_install, "which": cmd_which}
+           "doctor": cmd_doctor, "install": cmd_install, "which": cmd_which,
+           "resume": cmd_resume, "r": cmd_resume,
+           "last": cmd_last, "l": cmd_last,
+           "pin": cmd_pin, "unpin": lambda es, ar: cmd_pin(es, ar, remove=True),
+           "stats": cmd_stats}
 
     if a and a[0] in sub:
         return sub[a[0]](entries, a[1:])
@@ -785,8 +1301,10 @@ def main(argv):
     if not a:
         if not sys.stdin.isatty():
             return cmd_ls(entries, [])
-        e = picker(entries)
-        return cmd_launch(e, []) if e else 0
+        e, action = picker(entries)
+        if e is None:
+            return 0
+        return cmd_launch(e, [], resume=(action == "resume"))
 
     # 有参数 → 先精确匹配 id/alias
     e = find_entry(entries, a[0])
@@ -800,8 +1318,10 @@ def main(argv):
     if not sys.stdin.isatty():
         return die(f"没有 「{a[0]}」，候选：" +
                    ", ".join(x.id for x, _ in hits[:8]) if hits else f"没有 「{a[0]}」")
-    e = picker(entries, initial=a[0], prompt=f"筛选「{a[0]}」")
-    return cmd_launch(e, []) if e else 0
+    e, action = picker(entries, initial=a[0], prompt=f"筛选「{a[0]}」")
+    if e is None:
+        return 0
+    return cmd_launch(e, [], resume=(action == "resume"))
 
 
 if __name__ == "__main__":

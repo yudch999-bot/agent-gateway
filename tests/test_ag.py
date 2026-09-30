@@ -10,7 +10,7 @@
     ag    ： $AG_BIN → <仓库>/ag → ~/.local/bin/ag
     注册表： $AG_REGISTRY → <仓库>/registry.example.toml → ~/.agents/registry.example.toml
 """
-import importlib.machinery, importlib.util, io, os, re, sys, types
+import importlib.machinery, importlib.util, io, json, os, re, shutil, sys, tempfile, time, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,19 +30,26 @@ AG_BIN = _first(os.environ.get("AG_BIN"),
 if not AG_BIN:
     sys.exit("找不到 ag 主程序。设 AG_BIN=/path/to/ag 或先跑 install.sh")
 
-FIXTURE = _first(os.environ.get("AG_REGISTRY"),
+FIXTURE_SRC = _first(os.environ.get("AG_REGISTRY"),
                  os.path.join(ROOT, "registry.example.toml"),
                  os.path.join(HOME, ".agents/registry.example.toml"),
                  os.path.join(HOME, ".agents/registry.toml"))
-if not FIXTURE:
+if not FIXTURE_SRC:
     sys.exit("找不到夹具注册表。设 AG_REGISTRY=/path/to/registry.toml")
 
 REAL_OUT = sys.stdout
 def say(*a, **k):
     print(*a, file=REAL_OUT, **k)
 
+# 夹具复制一份到临时目录再指过去：
+# usage.jsonl / pins.json 是跟注册表同级的，这样测试写的状态全在临时目录里，
+# 不会往仓库里拉屎，也不会踩到用户真实的 ~/.agents/registry.toml
+_TMPDIR = tempfile.mkdtemp(prefix="ag-test-")
+_FIXTURE = os.path.join(_TMPDIR, "registry.toml")
+shutil.copyfile(FIXTURE_SRC, _FIXTURE)
+
 # 注册表必须在 import ag 之前设好（REGISTRY 是导入期读的）
-os.environ["AG_REGISTRY"] = FIXTURE
+os.environ["AG_REGISTRY"] = _FIXTURE
 
 loader = importlib.machinery.SourceFileLoader("agmod", AG_BIN)
 spec = importlib.util.spec_from_loader("agmod", loader)
@@ -50,7 +57,7 @@ ag = importlib.util.module_from_spec(spec)
 loader.exec_module(ag)
 
 say(f"  ag   : {AG_BIN}")
-say(f"  注册表: {FIXTURE}")
+say(f"  注册表: {FIXTURE_SRC}  (测试用副本: {_TMPDIR})")
 say()
 
 # ---------------------------------------------------------------- 假终端
@@ -109,7 +116,11 @@ def run(seq, argv=None):
     got = {}
     ag.sys.stdin, ag.sys.stdout = FakeIn(), buf
     ag.sys.argv = argv or ["ag"]
-    ag.cmd_launch = lambda e, extra: (got.setdefault("launched", (e.id, extra)), 0)[1]
+    def fake_launch(e, extra, resume=False):
+        got["launched"] = (e.id, extra)
+        got["resume"] = resume
+        return 0
+    ag.cmd_launch = fake_launch
     try:
         rc = ag.main(ag.sys.argv)
     finally:
@@ -279,9 +290,136 @@ else:
     check("解析逻辑不抛异常", all(x.resolved() is None or os.path.exists(x.resolved())
                                   for x in reg))
 
+# 续聊命令不能有重复参数 —— args 里已经有的就别在 resume 里再写一遍。
+# 这个检查是因为 ht 真踩过：hermes --tui --tui --continue
+dupes = []
+for x in reg:
+    if not x.can_resume:
+        continue
+    argv = x.resume_argv()
+    seen, dup = set(), set()
+    for a in argv[2:]:
+        (dup if a in seen else seen).add(a)
+    if dup:
+        dupes.append(f"{x.id}: {' '.join(argv)} (重复 {sorted(dup)})")
+check("续聊命令没有重复参数", not dupes, "; ".join(dupes))
+say(f"  · 可续聊的 agent: {sum(1 for x in reg if x.can_resume)}/{len(reg)}")
+
+say()
+say("9) frecency 使用频率评分")
+NOW = 1_800_000_000.0
+u = {"hot": [NOW - 3600, NOW - 7200, NOW - 10800],     # 今天用了 3 次
+     "warm": [NOW - 86400 * 3],                        # 3 天前 1 次
+     "cold": [NOW - 86400 * 60],                       # 60 天前 1 次
+     "ancient": [NOW - 86400 * 400]}                   # 一年多前
+fr = ag.frecency(u, now=NOW)
+say("  分数：" + "  ".join(f"{k}={v:.3f}" for k, v in sorted(fr.items(), key=lambda t: -t[1])))
+check("今天用 3 次的 > 3 天前用 1 次的", fr["hot"] > fr["warm"])
+check("3 天前的 > 60 天前的", fr["warm"] > fr["cold"])
+check("60 天前的 > 400 天前的", fr["cold"] > fr["ancient"])
+check("半衰期算得对（14 天整应衰减到一半）",
+      abs(ag.frecency({"x": [NOW - 86400 * 14]}, now=NOW)["x"] - 0.5) < 1e-9)
+check("一次没用过的没有分", "nobody" not in fr)
+
+say()
+say("10) 排序：置顶 > 常用 > 注册表顺序")
+small = [ag.Entry(dict(id=i, cmd="echo")) for i in ["a1", "b2", "c3", "d4"]]
+# a1 常用但没置顶；c3 置顶但没用过
+hits = [(e, 0) for e in small]
+u2 = {"a1": [NOW - 100] * 5, "b2": [NOW - 100]}
+ordered = [e.id for e, _ in ag.order_hits(hits, u2, ["c3"], query="", entries=small)]
+say("  空查询顺序：" + " > ".join(ordered))
+check("置顶的排第一", ordered[0] == "c3")
+check("其余的按常用程度排", ordered[1] == "a1" and ordered[2] == "b2")
+check("没用过的垫底", ordered[3] == "d4")
+
+# 一打字就该按命中质量排，置顶不能压过精确命中
+hits2 = ag.fuzzy(small, "d4")
+ordered2 = [e.id for e, _ in ag.order_hits(hits2, u2, ["c3"], query="d4", entries=small)]
+check("有查询时精确命中优先于置顶", ordered2[0] == "d4", str(ordered2))
+
+say()
+say("11) 续聊：Ctrl-R")
+reg_now = ag.load_registry()
+say(f"  · 注册表里 {sum(1 for e in reg_now if e.can_resume)} 条支持续聊")
+out, got, _ = run([b""])                     # Ctrl-R，光标在第 1 项
+first = ag.order_hits(ag.fuzzy([e for e in reg_now if not e.hidden], ""),
+                      ag.load_usage(), ag.load_pins(), query="", entries=reg_now)[0][0]
+if first.can_resume:
+    check("Ctrl-R 走续聊", got.get("resume") is True, str(got))
+else:
+    check("Ctrl-R 对不支持续聊的给提示", "resume" not in got, str(got))
+
+# 明确挑一个支持续聊的
+res_entry = next(e for e in reg_now if e.can_resume and not e.hidden)
+out, got, _ = run([res_entry.id.encode(), ENTER])
+check(f"回车是普通启动（{res_entry.id}）", got.get("resume") is False, str(got))
+out, got, _ = run([res_entry.id.encode(), b"\x12"])   # Ctrl-R
+check(f"Ctrl-R 是续聊（{res_entry.id}）", got.get("resume") is True, str(got))
+check("续聊时启动的还是同一个 agent",
+      got.get("launched", ("",))[0] == res_entry.id, str(got.get("launched")))
+
+say()
+say("12) 置顶：Ctrl-T + pins.json")
+pins_path = os.path.join(ag.STATE_DIR, "pins.json")
+if os.path.exists(pins_path):
+    os.unlink(pins_path)
+out, got, _ = run([b"", ESC])                # Ctrl-T 然后退出
+pins_now = ag.load_pins()
+check("Ctrl-T 写进了 pins.json", len(pins_now) == 1, str(pins_now))
+check("置顶项出现在列表里", "★" in strip(out))
+out, got, _ = run([b"", ESC])                # 再来一次 = 取消
+check("再按一次取消置顶", ag.load_pins() == [], str(ag.load_pins()))
+
+say()
+say("13) 帮助面板：?")
+out, got, _ = run([b"?", ESC])
+txt = strip(out)
+check("? 打开帮助面板", "按键" in txt and "Ctrl-R" in txt, txt[-200:])
+check("帮助里说明了排序规则", "半衰期" in txt)
+check("帮助面板里不会误启动", "launched" not in got)
+
+say()
+say("14) 子命令：pin / unpin / last / stats")
+def runcmd(args, expect_rc=None):
+    buf, err = io.StringIO(), io.StringIO()
+    saved = ag.sys.stdout, ag.sys.stderr, ag.sys.argv
+    ag.sys.stdout, ag.sys.stderr = buf, err
+    ag.sys.argv = ["ag", *args]
+    try:
+        rc = ag.main(ag.sys.argv)
+    finally:
+        ag.sys.stdout, ag.sys.stderr = saved[0], saved[1]
+        ag.sys.argv = saved[2]
+    return rc, buf.getvalue()
+
+rc, o = runcmd(["pin", "cc", "oc"])
+check("ag pin 两条", rc == 0 and set(ag.load_pins()) == {"cc", "oc"}, str(ag.load_pins()))
+rc, o = runcmd(["pin", "nope"])
+check("ag pin 不存在的会跳过而不是崩", rc == 0)
+rc, o = runcmd(["pin"])
+check("ag pin 无参数 = 列出", "★" in o and "cc" in o)
+rc, o = runcmd(["unpin", "oc"])
+check("ag unpin", rc == 0 and ag.load_pins() == ["cc"], str(ag.load_pins()))
+
+# 造一条使用记录，验证 ag last 认得出来
+with open(ag.USAGE, "a", encoding="utf-8") as f:
+    for eid in ("cc", "goose"):
+        f.write(json.dumps({"t": int(time.time()), "id": eid,
+                            "cwd": "/tmp", "resumed": False}) + "\n")
+rc, o = runcmd(["last"])
+check("ag last 认最后一条记录（不是时间戳最大的）",
+      "goose" in o, o.strip()[:100])
+
+rc, o = runcmd(["stats"])
+check("ag stats 出表格", rc == 0 and "使用统计" in o and "goose" in o)
+rc, o = runcmd(["stats", "--history"])
+check("ag stats --history 出时间线", rc == 0 and "最近的启动" in o)
+
 say()
 say("=" * 64)
 if fail:
     say(f"❌ {len(fail)} 项失败： {fail}")
     sys.exit(1)
+shutil.rmtree(_TMPDIR, ignore_errors=True)
 say("✅ 全部通过")
