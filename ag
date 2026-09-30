@@ -54,7 +54,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -1126,9 +1126,24 @@ def picker(entries, initial="", prompt="选一个 agent"):
             hits = order_hits(fuzzy(pool, kw), usage, pins,
                               query=kw, entries=pool)
             items = [e for e, _ in hits]
-            # 空关键词（或只按组过滤）时按组显示，一打字就切回平铺
-            groups = (grouped(items, usage, pins, entries=visible)
-                      if not kw.strip() else None)
+
+            # 空关键词时按组显示。
+            #
+            # 关键：items 必须跟着摊平成「显示顺序」。
+            # cursor 索引的是 items，屏幕画的是 rows —— 两边顺序不一致的话，
+            # 高亮打在一个地方、窗口却按另一个地方居中，按上下键就像在乱跳。
+            groups = None
+            rows = []
+            if not kw.strip():
+                groups = grouped(items, usage, pins, entries=visible)
+                items = []
+                for gname, es in groups:
+                    rows.append(("h", gname))
+                    for e in es:
+                        rows.append(("i", e, len(items)))
+                        items.append(e)
+            else:
+                rows = [("i", e, i) for i, e in enumerate(items)]
             if cursor >= len(items):
                 cursor = max(0, len(items) - 1)
 
@@ -1138,16 +1153,6 @@ def picker(entries, initial="", prompt="选一个 agent"):
 
             # 组标题也要占行，所以先摊成「显示行」，光标定位按显示行算，
             # 不然滚到后面光标会跑出可视区
-            # ("h", 标题) 或 ("i", 条目, 它在 items 里的下标)
-            rows = []
-            if groups:
-                for gname, es in groups:
-                    rows.append(("h", gname))
-                    idx_of = {id(e): k for k, e in enumerate(items)}
-                    rows.extend(("i", e, idx_of.get(id(e), 0)) for e in es)
-            else:
-                rows = [("i", e, i) for i, e in enumerate(items)]
-
             # 标题行也要占地方，先扣掉
             head_lines = sum(1 for r in rows if r[0] == "h")
             list_h = max(5, list_h - min(head_lines, 6))

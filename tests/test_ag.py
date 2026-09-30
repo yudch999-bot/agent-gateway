@@ -56,6 +56,12 @@ spec = importlib.util.spec_from_loader("agmod", loader)
 ag = importlib.util.module_from_spec(spec)
 loader.exec_module(ag)
 
+# ag 导入时 stdout 不是 tty，颜色会被自动关掉。渲染相关的断言要靠反显（\033[7m）
+# 定位高亮行，所以这里强制打开 —— 别处用 strip() 之后不受影响。
+ag.C = dict(r="\033[0m", b="\033[1m", dim="\033[2m", red="\033[31m",
+            grn="\033[32m", yel="\033[33m", blu="\033[34m", mag="\033[35m",
+            cyn="\033[36m", gry="\033[90m", inv="\033[7m")
+
 say(f"  ag   : {AG_BIN}")
 say(f"  注册表: {FIXTURE_SRC}  (测试用副本: {_TMPDIR})")
 say()
@@ -970,6 +976,53 @@ out, got, _ = run([TAB, b"\x1b[B", b"\x1b[B", b"\x1b[B", b"\x1b[B", b"\x1b[B",
                    b"\x1b[B", b"\x1b[B", b"\x1b[B", TAB, ENTER])
 ids_picked = got.get("many", [])
 check("能跨组选两个", len(ids_picked) == 2, str(ids_picked))
+
+say("  · 导航：上下键必须严格按屏幕顺序走")
+# 这个 bug 真发生过：cursor 索引的是「命中顺序」，屏幕画的是「分组顺序」，
+# 两边分叉之后高亮和窗口各走各的，按上下键看起来就是在乱跳。
+reg_n = [e for e in ag.load_registry() if not e.hidden]
+hits_n = ag.order_hits(ag.fuzzy(reg_n, ""), ag.load_usage(), ag.load_pins(),
+                       query="", entries=reg_n)
+EXPECT = [e.id for _, es in ag.grouped([e for e, _ in hits_n], ag.load_usage(),
+                                       ag.load_pins(), entries=reg_n) for e in es]
+
+def press(key, times, prefix=()):
+    """连按同一个键，返回每步的高亮项和当时屏幕上的可见项。"""
+    keys, steps = list(prefix), []
+    for _ in range(times):
+        keys.append(key)
+        lines = frames_of(run(list(keys) + [ESC])[0])[-1].split("\r\n")
+        hl = next((strip(l).split()[1] for l in lines
+                   if l.startswith("\033[7m")), None)
+        vis = {strip(l).split()[1] for l in lines
+               if strip(l).strip().startswith(("●", "○", "★", "▣"))}
+        steps.append((hl, vis))
+    return steps
+
+down = press(b"\x1b[B", len(EXPECT) + 6)
+down_ids = [h for h, _ in down]
+want_down = EXPECT[1:] + [EXPECT[-1]] * 7
+check("↓ 的路径 == 屏幕顺序（一条不差）", down_ids == want_down,
+      next((f"第{i+1}步 {a}≠{b}" for i, (a, b) in enumerate(zip(down_ids, want_down))
+            if a != b), f"长度 {len(down_ids)} vs {len(want_down)}"))
+check("↓ 到底后不越界（停在最后一条）", down_ids[-1] == EXPECT[-1], str(down_ids[-1]))
+bad_vis = [f"第{i+1}步 {h}" for i, (h, vis) in enumerate(down) if h and h not in vis]
+check("一路 ↓ 高亮从没跑出可视区", not bad_vis, ", ".join(bad_vis))
+
+up = press(b"\x1b[A", len(EXPECT) + 6,
+           prefix=[b"\x1b[B"] * (len(EXPECT) + 6))
+up_ids = [h for h, _ in up]
+idx = [EXPECT.index(x) for x in up_ids if x]
+check("↑ 最终回到第一条", up_ids[-1] == EXPECT[0], str(up_ids[-1]))
+check("↑ 是单调往回走", idx == sorted(idx, reverse=True), str(idx[:12]))
+bad_vis2 = [f"第{i+1}步 {h}" for i, (h, vis) in enumerate(up) if h and h not in vis]
+check("一路 ↑ 高亮也没跑出可视区", not bad_vis2, ", ".join(bad_vis2))
+
+say("  · 打字后光标回第一条")
+f = frames_of(run([b"\x1b[B", b"\x1b[B", b"\x1b[B", b"c", b"c", ESC])[0])[-1]
+got_c = next((strip(l).split()[1] for l in f.split("\r\n")
+              if l.startswith("\033[7m")), None)
+check("打了关键词后高亮在首条", got_c == "cc", str(got_c))
 
 say("  · 注册表分组完整性")
 reg_g = ag.load_registry()
