@@ -40,6 +40,7 @@ import tomllib
 import json
 import time
 import re
+import shlex
 
 # ---------------------------------------------------------------- 常量
 
@@ -53,7 +54,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -442,18 +443,257 @@ def cmd_launch(e: Entry, extra, resume=False):
         return die(f"启动失败：{ex}")
 
 
+# ---------------------------------------------------------------- 一次开多个
+
+def tmux_session_name():
+    """当前 tmux 会话名；不在 tmux 里返回 None。"""
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        r = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def session_exists(tmux, name):
+    try:
+        return subprocess.run([tmux, "has-session", "-t", name],
+                              capture_output=True).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def terminal_fallback(entries, resume=False):
+    """没有 tmux 时的退路：macOS 开 Terminal 窗口，其它平台就把命令打出来。"""
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        for e in entries:
+            argv = e.resume_argv() if resume else e.argv()
+            cwd = os.path.expanduser(e.cwd) if e.cwd else os.getcwd()
+            script = ('tell application "Terminal" to do script '
+                      '"cd %s && %s"' % (cwd.replace('"', '\\"'),
+                                         " ".join(argv).replace('"', '\\"')))
+            subprocess.run(["osascript", "-e", script], check=False)
+            record_use(e.id, cwd, resumed=resume)
+            print(f"  {C['grn']}▶{C['r']} {C['b']}{e.name}{C['r']}"
+                  f"  {C['gry']}新 Terminal 窗口{C['r']}")
+        print(f"\n  {C['gry']}装个 tmux 会更好用：{C['cyn']}brew install tmux{C['r']}"
+              f"{C['gry']}（多窗口、能挂后台、关了终端也不掉）{C['r']}\n")
+        return 0
+
+    print(f"\n  {C['yel']}没装 tmux，也开不了新终端窗口。{C['r']}"
+          f"{C['gry']}手动开几个终端跑这些：{C['r']}\n")
+    for e in entries:
+        argv = e.resume_argv() if resume else e.argv()
+        print(f"    {C['cyn']}{' '.join(argv)}{C['r']}")
+    print(f"\n  {C['gry']}装 tmux 就能自动分好：{C['cyn']}brew install tmux{C['r']}\n")
+    return 1
+
+
+def build_tmux_plan(entries, sess, layout="windows", resume=False, fresh=True):
+    """算出要跑哪些 tmux 命令。纯函数，不执行 —— 方便测。"""
+    plan = []
+    for i, e in enumerate(entries):
+        argv = e.resume_argv() if resume else e.argv()
+        cwd = os.path.expanduser(e.cwd) if e.cwd else os.getcwd()
+        if not os.path.isdir(cwd):
+            cwd = os.getcwd()
+        if i == 0 and fresh:
+            base = ["new-session", "-d", "-s", sess]
+        elif layout == "panes":
+            base = ["split-window", "-t", sess]
+        else:
+            base = ["new-window", "-t", sess]
+        # 命令整条作为一个参数交给 tmux，它再过 shell —— 
+        # 这样带空格的参数也不会散架，也不用纠结 tmux 的 -- 语义
+        plan.append((["tmux", *base, "-n", e.id, "-c", cwd,
+                      shlex.join(argv)], e))
+    if layout == "panes":
+        plan.append((["tmux", "select-layout", "-t", sess, "tiled"], None))
+    return plan
+
+
+def launch_many(entries, layout="windows", resume=False, session=None):
+    """一次拉起多个 agent，每个占一个 tmux 窗口（或分屏）。
+
+    在 tmux 里 → 往当前会话加窗口，人不用动
+    不在 tmux 里 → 建一个会话再 attach 进去；关掉终端它们也还活着
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return terminal_fallback(entries, resume)
+
+    inside = tmux_session_name()
+    sess = session or inside or "ag"
+    fresh = not session_exists(tmux, sess)
+
+    plan = build_tmux_plan(entries, sess, layout, resume, fresh)
+    ran, failed, errs = [], [], []
+    for argv, e in plan:
+        try:
+            # stderr 一定要收着 —— 不然 tmux 失败了用户完全看不出为什么
+            r = subprocess.run(argv, check=False, capture_output=True, text=True)
+            rc, err = r.returncode, (r.stderr or "").strip()
+        except OSError as ex:
+            rc, err = 1, str(ex)
+        if e is None:
+            continue
+        if rc == 0:
+            ran.append(e)
+        else:
+            failed.append(e)
+            if err and err not in errs:
+                errs.append(err)
+
+    if not ran:
+        print(f"  {C['red']}✗ tmux 一条命令都没跑成{C['r']}"
+              f"  {C['gry']}（会话 {sess}）{C['r']}")
+        for err in errs[:3]:
+            print(f"    {C['red']}{trunc(err, 76)}{C['r']}")
+        if any("fork failed" in e or "Operation not permitted" in e for e in errs):
+            print(f"  {C['gry']}提示：这是权限/沙箱限制，不是 tmux 本身的问题。"
+                  f"在真终端里跑就正常了{C['r']}")
+        else:
+            print(f"  {C['gry']}先确认 tmux 能用：{C['cyn']}tmux new -s test{C['r']}")
+        print(f"  {C['gry']}想看会执行什么：{C['cyn']}ag team --dry-run "
+              f"{' '.join(e.id for e in entries)}{C['r']}\n")
+        return 1
+
+    for e in ran:
+        try:
+            record_use(e.id, os.getcwd(), resumed=resume)
+        except Exception:
+            pass
+
+    tag = "分屏" if layout == "panes" else "窗口"
+    print(f"\n  {C['grn']}✓{C['r']} {C['b']}{len(ran)}{C['r']} 个 agent，"
+          f"一人一个 tmux {tag}：")
+    for e in ran:
+        argv = e.resume_argv() if resume else e.argv()
+        mark = f" {C['mag']}↻{C['r']}" if resume else ""
+        print(f"    {C['b']}{pad(e.id, 14)}{C['r']}{mark} "
+              f"{C['gry']}{' '.join(argv)}{C['r']}")
+    if failed:
+        print(f"  {C['yel']}!{C['r']} {len(failed)} 个没开成："
+              f"{', '.join(e.id for e in failed)}")
+        for err in errs[:2]:
+            print(f"    {C['gry']}{trunc(err, 74)}{C['r']}")
+
+    if inside:
+        try:
+            subprocess.run([tmux, "select-window", "-t", f"{sess}:{ran[-1].id}"],
+                           check=False, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+        print(f"\n  {C['gry']}它们就在你当前这个 tmux 会话里。"
+              f"切窗口：{C['cyn']}Ctrl-B 数字/n/p{C['r']}"
+              f"{C['gry']}，列表：{C['cyn']}Ctrl-B w{C['r']}\n")
+    else:
+        print(f"\n  {C['gry']}正在进入 tmux 会话 {C['cyn']}{sess}{C['r']}"
+              f"{C['gry']}——它们会一直在后台活着{C['r']}")
+        print(f"  {C['gry']}切窗口 {C['cyn']}Ctrl-B 数字/n/p{C['r']}"
+              f"{C['gry']}　脱离 {C['cyn']}Ctrl-B d{C['r']}"
+              f"{C['gry']}　回来 {C['cyn']}ag attach{C['r']}\n")
+        sys.stdout.flush()
+        try:
+            os.execvp(tmux, [tmux, "attach", "-t", sess])
+        except OSError as ex:
+            return die(f"attach 失败：{ex}")
+    return 0
+
+
+def cmd_team(entries, args):
+    """一次开多个 agent，各占一个窗口。
+
+        ag team                  打开多选器（Tab 勾选）
+        ag team cc oc goose      直接指定几个
+        ag team --panes cc oc    用分屏而不是分窗口
+        ag team -r cc oc         都续聊上次的会话
+    """
+    layout = "panes" if "--panes" in args else "windows"
+    resume = "-r" in args or "--resume" in args
+    session = None
+    for a in args:
+        if a.startswith("--session="):
+            session = a.split("=", 1)[1]
+    ids = [a for a in args if not a.startswith("-")]
+
+    if ids:
+        picked = []
+        for a in ids:
+            e = find_entry(entries, a)
+            if not e:
+                return die(f"注册表里没有 「{a}」")
+            picked.append(e)
+    else:
+        if not sys.stdin.isatty():
+            return die("用法：ag team <id> [id...]（非交互环境必须写全）")
+        picked, _ = picker(entries, prompt="多选（Tab 勾选，Enter 一次全开）")
+        if not picked:
+            print(f"  {C['gry']}没选，退出{C['r']}")
+            return 0
+
+    if "--dry-run" in args or "-n" in args:
+        sess = session or "ag"
+        print(f"\n  {C['b']}将开 {len(picked)} 个 tmux "
+              f"{'分屏' if layout == 'panes' else '窗口'}{C['r']}"
+              f"  {C['gry']}(--dry-run，没真跑){C['r']}\n")
+        for argv, e in build_tmux_plan(picked, sess, layout, resume, fresh=True):
+            if e is None:
+                print(f"    {C['gry']}{shlex.join(argv)}{C['r']}")
+            else:
+                print(f"    {C['b']}{pad(e.id, 12)}{C['r']} "
+                      f"{C['cyn']}{argv[-1]}{C['r']}")
+        print()
+        return 0
+
+    missing = [e.id for e in picked if not e.resolved()]
+    if missing:
+        print(f"  {C['yel']}!{C['r']} 这几个没装，会开个空窗口：{', '.join(missing)}")
+
+    if len(picked) == 1 and not ids:
+        return cmd_launch(picked[0], [], resume=resume)
+    return launch_many(picked, layout=layout, resume=resume, session=session)
+
+
+def cmd_attach(entries, args):
+    """回到之前的 tmux 会话。"""
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return die("没装 tmux。brew install tmux")
+    sess = args[0] if args else (os.environ.get("AG_TMUX_SESSION") or "ag")
+    if not session_exists(tmux, sess):
+        print(f"  {C['gry']}没有叫 {sess} 的会话。开一个：{C['cyn']}ag team{C['r']}")
+        try:
+            r = subprocess.run([tmux, "list-sessions"], capture_output=True,
+                               text=True, timeout=5)
+            if r.stdout.strip():
+                print(f"\n  {C['b']}现有的 tmux 会话：{C['r']}")
+                for ln in r.stdout.splitlines():
+                    print(f"    {ln}")
+                print()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return 1
+    if os.environ.get("TMUX"):
+        return subprocess.run([tmux, "switch-client", "-t", sess]).returncode
+    os.execvp(tmux, [tmux, "attach", "-t", sess])
+
+
 # ---------------------------------------------------------------- 模糊选择器
 
 def picker(entries, initial="", prompt="选一个 agent"):
     """全屏模糊选择器。
 
-    返回 (Entry, action)：
-        action = "run"     普通启动
-                 "resume"  续聊（Ctrl-R）
-    取消返回 (None, None)。
+    返回 (entries, action)：
+        entries  选中的 agent 列表。按过 Tab 多选就是多个，否则就是光标那一个
+        action   "run" 普通启动 / "resume" 续聊（Ctrl-R）
+    取消返回 ([], None)。
     """
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        return None, None
+        return [], None
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -508,6 +748,8 @@ def picker(entries, initial="", prompt="选一个 agent"):
             return "RESUME"
         if b == b"\x0f":
             return "CONFIG"
+        if b == b"\t":
+            return "TOGGLE"
         if b == b"\x14":
             return "PIN"
         if b == b"\x15":
@@ -535,6 +777,7 @@ def picker(entries, initial="", prompt="选一个 agent"):
     pins = load_pins()
     show_help = False
     flash = ""
+    selected = []          # 多选，按选中的先后顺序
     W = term_width()
 
     idw = max([vis_len(e.id) for e in visible] + [2])
@@ -556,9 +799,13 @@ def picker(entries, initial="", prompt="选一个 agent"):
             top = max(0, min(cursor - list_h // 2, len(items) - list_h))
 
             out = ["\033[H\033[2J"]
+            sel_note = (f"  {C['cyn']}{C['b']}已选 {len(selected)}{C['r']}"
+                        f"{C['gry']}：{','.join(selected[:4])}"
+                        f"{'…' if len(selected) > 4 else ''}{C['r']}"
+                        if selected else "")
             out.append(f"  {C['b']}{C['mag']}ag{C['r']} {C['dim']}Agent Gateway{C['r']}"
                        f"  {C['gry']}{len(items)}/{len(visible)} · {prompt}"
-                       f" · 输入即筛选{C['r']}\r\n")
+                       f" · 输入即筛选{C['r']}{sel_note}\r\n")
 
             if show_help:
                 out.append(render_help(W))
@@ -604,8 +851,12 @@ def picker(entries, initial="", prompt="选一个 agent"):
                 nmc = pad(trunc(e.name, namew), namew)
                 dsc = trunc(e.desc, max(10, W - idw - namew - 14))
                 # 选中行与非选中行前缀完全一致，只靠反显区分，避免左右跳动
-                dot = "★" if pinned else ("●" if ok else "○")
-                dotc = C['grn'] if ok else C['red']
+                if e.id in selected:
+                    dot, dotc = "▣", C['cyn']
+                elif pinned:
+                    dot, dotc = "★", C['mag']
+                else:
+                    dot, dotc = ("●", C['grn']) if ok else ("○", C['red'])
                 star = f"{C['mag']}↻{C['r']} " if e.can_resume else "  "
                 if i == cursor:
                     line = (f"{C['inv']}  {dotc}{dot}{C['r']}"
@@ -640,7 +891,9 @@ def picker(entries, initial="", prompt="选一个 agent"):
                 out.append(f"  {C['yel']}{flash}{C['r']}\r\n")
                 flash = ""
             else:
-                out.append(f"  {C['gry']}↑↓ 移动 · Enter 启动 · Ctrl-R 续聊 · "
+                hint = ("Enter 一次全开（各占一个窗口）" if len(selected) > 1
+                        else "Tab 多选")
+                out.append(f"  {C['gry']}↑↓ 移动 · {hint} · Ctrl-R 续聊 · "
                            f"Ctrl-T 置顶 · Ctrl-O 配置 · ? 帮助 · Esc 退出{C['r']}\r\n")
 
             sys.stdout.write("".join(out))
@@ -648,15 +901,29 @@ def picker(entries, initial="", prompt="选一个 agent"):
 
             k = read_key()
             if k in ("ESC", "EOF"):
-                return None, None
+                return [], None
             if k == "ENTER":
-                return (items[cursor], "run") if items else (None, None)
-            if k == "RESUME":
+                if selected:
+                    chosen = [e for e in visible if e.id in selected]
+                    return chosen, "run"
+                return ([items[cursor]], "run") if items else ([], None)
+            if k == "TOGGLE":
+                if not items:
+                    continue
+                e = items[cursor]
+                if e.id in selected:
+                    selected.remove(e.id)
+                    flash = f"取消选中 {e.id}"
+                else:
+                    selected.append(e.id)
+                    flash = f"已选 {len(selected)} 个（再按 Tab 可继续加）"
+                cursor = min(len(items) - 1, cursor + 1)
+            elif k == "RESUME":
                 if not items:
                     continue
                 e = items[cursor]
                 if e.can_resume:
-                    return e, "resume"
+                    return [e], "resume"
                 flash = f"{e.id} 没登记续聊方式 —— 在注册表里加 resume = [...]"
             elif k == "PIN":
                 if not items:
@@ -724,7 +991,8 @@ def render_help(W):
         ("PgUp PgDn / Home End", "翻页 / 跳首尾"),
         ("Backspace", "删一个字符"),
         ("Ctrl-U", "清空筛选词"),
-        ("Enter", "启动选中项（新会话）"),
+        ("Tab", "多选 —— 勾几个，Enter 一次全开，各占一个 tmux 窗口"),
+        ("Enter", "启动。有勾选就全开，没勾选就开光标那个（新会话）"),
         ("Ctrl-R", "续聊 —— 接上次的会话（需要注册表里有 resume 字段）"),
         ("Ctrl-T", "置顶 / 取消置顶（★ 标记，会排在前面）"),
         ("Ctrl-O", "打开该 agent 的配置目录"),
@@ -735,8 +1003,13 @@ def render_help(W):
         ("", "空查询时按 置顶 > 常用程度 排；一打字就按命中质量排。"),
         ("", "常用程度 = 用过的次数按 14 天半衰期衰减，常用来的一直在前面。"),
         ("", ""),
+        ("", "一次开多个"),
+        ("", "Tab 勾上几个再 Enter，每个 agent 各占一个 tmux 窗口，"),
+        ("", "关掉终端它们也还活着，ag attach 就能回来。"),
+        ("", "想同屏都看见用 ag team --panes。"),
+        ("", ""),
         ("", "关于快捷键"),
-        ("", "★ 置顶   ↻ 支持续聊   ● 可用   ○ 没装"),
+        ("", "▣ 已勾选   ★ 置顶   ↻ 支持续聊   ● 可用   ○ 没装"),
     ]
     out = [f"  {C['gry']}{'─' * min(W - 4, 96)}{C['r']}\r\n"]
     for k, v in rows:
@@ -1876,10 +2149,17 @@ def usage():
   {C['b']}{C['mag']}ag{C['r']} {C['dim']}Agent Gateway v{VERSION}{C['r']}  —  一个命令管住所有 AI coding agent
 
   {C['b']}启动{C['r']}
-    ag                    打开模糊选择器（输入即筛选，回车启动）
+    ag                    打开模糊选择器（Tab 可多选，回车一次全开）
     ag <id>               直接启动，例： ag cc / ag oc / ag ot-ceo
     ag <id> [参数...]     透传给 agent
     ag <关键词>           没精确匹配时，打开预筛选的选择器
+
+  {C['b']}一次开多个（tmux 窗口/分屏）{C['r']}
+    ag team               打开多选器，勾几个就开几个
+    ag team cc oc goose   直接指定几个
+    ag team --panes cc oc 用分屏（同屏都能看见）
+    ag team -r cc oc      都续聊上次的会话
+    ag attach             回到之前的 tmux 会话
 
   {C['b']}接着上次干{C['r']}
     ag last               接着上次那个 agent、上次那个会话继续
@@ -1949,7 +2229,8 @@ def main(argv):
            "update": cmd_update, "upgrade": cmd_update, "up": cmd_update,
            "outdated": cmd_outdated, "old": cmd_outdated,
            "search": cmd_search, "find": cmd_search, "s": cmd_search,
-           "handoff": cmd_handoff, "ho": cmd_handoff}
+           "handoff": cmd_handoff, "ho": cmd_handoff,
+           "team": cmd_team, "multi": cmd_team, "attach": cmd_attach}
 
     if a and a[0] in sub:
         return sub[a[0]](entries, a[1:])
@@ -1961,10 +2242,12 @@ def main(argv):
     if not a:
         if not sys.stdin.isatty():
             return cmd_ls(entries, [])
-        e, action = picker(entries)
-        if e is None:
+        picked, action = picker(entries)
+        if not picked:
             return 0
-        return cmd_launch(e, [], resume=(action == "resume"))
+        if len(picked) > 1:
+            return launch_many(picked, resume=(action == "resume"))
+        return cmd_launch(picked[0], [], resume=(action == "resume"))
 
     # 有参数 → 先精确匹配 id/alias
     e = find_entry(entries, a[0])
@@ -1978,10 +2261,12 @@ def main(argv):
     if not sys.stdin.isatty():
         return die(f"没有 「{a[0]}」，候选：" +
                    ", ".join(x.id for x, _ in hits[:8]) if hits else f"没有 「{a[0]}」")
-    e, action = picker(entries, initial=a[0], prompt=f"筛选「{a[0]}」")
-    if e is None:
+    picked, action = picker(entries, initial=a[0], prompt=f"筛选「{a[0]}」")
+    if not picked:
         return 0
-    return cmd_launch(e, [], resume=(action == "resume"))
+    if len(picked) > 1:
+        return launch_many(picked, resume=(action == "resume"))
+    return cmd_launch(picked[0], [], resume=(action == "resume"))
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@
     ag    ： $AG_BIN → <仓库>/ag → ~/.local/bin/ag
     注册表： $AG_REGISTRY → <仓库>/registry.example.toml → ~/.agents/registry.example.toml
 """
-import importlib.machinery, importlib.util, io, json, os, re, shutil, sys, tempfile, time, types
+import importlib.machinery, importlib.util, io, json, os, re, shlex, shutil, sys, tempfile, time, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -100,6 +100,8 @@ ag.os = FakeOs()
 ag.termios = FakeTermios()
 ag.tty = FakeTty()
 _real_select, _real_shutil = ag.select, ag.shutil
+_real_subprocess = ag.subprocess
+_real_launch_many = ag.launch_many      # run() 会把它换成桩，先留个真身
 ag.select = types.SimpleNamespace(select=lambda *a, **k: ([0], [], []))
 ag.shutil = types.SimpleNamespace(
     get_terminal_size=lambda d=(100, 24): os.terminal_size((110, 30)),
@@ -120,7 +122,14 @@ def run(seq, argv=None):
         got["launched"] = (e.id, extra)
         got["resume"] = resume
         return 0
+
+    def fake_many(entries, layout="windows", resume=False, session=None):
+        got["many"] = [e.id for e in entries]
+        got["many_layout"] = layout
+        got["many_resume"] = resume
+        return 0
     ag.cmd_launch = fake_launch
+    ag.launch_many = fake_many
     try:
         rc = ag.main(ag.sys.argv)
     finally:
@@ -669,6 +678,103 @@ cmd = "echo"
 finally:
     ag.REGISTRY = saved_reg
     shutil.rmtree(SESS_DIR, ignore_errors=True)
+
+say()
+say("17) 一次开多个（Tab 多选 + tmux）")
+TAB = b"\t"
+
+say("  · Tab 多选，Enter 一次全开")
+out, got, _ = run([TAB, TAB, ENTER])
+check("选了 2 个就交给 launch_many", "many" in got and len(got["many"]) == 2,
+      str(got.get("many")))
+out, got, _ = run([TAB, ENTER])
+check("只勾 1 个时走单开", "launched" in got and "many" not in got, str(got))
+check("勾选后光标会往下走（方便连勾）",
+      strip(out).count("▣") >= 1, strip(out)[-300:])
+
+say("  · 再按一次 Tab 取消选中")
+# Tab 勾上第 1 个（光标自动下移）-> ↑ 回到第 1 个 -> Tab 取消 -> Enter
+out, got, _ = run([TAB, b"\x1b[A", TAB, ENTER])
+check("同一个再勾一次是取消，于是走单开", "launched" in got and "many" not in got,
+      str(got))
+
+say("  · build_tmux_plan")
+reg_t = ag.load_registry()
+three = [ag.find_entry(reg_t, i) for i in ("cc", "oc", "goose")]
+plan = ag.build_tmux_plan(three, "ag", "windows", resume=False, fresh=True)
+check("窗口模式：第一个 new-session，其余 new-window",
+      plan[0][0][1] == "new-session" and plan[1][0][1] == "new-window"
+      and plan[2][0][1] == "new-window", str([p[0][1] for p in plan]))
+check("窗口名用了短名", [p[0][p[0].index("-n") + 1] for p in plan] == ["cc", "oc", "goose"])
+check("每条都带 -c 工作目录", all("-c" in p[0] for p in plan))
+check("命令是整条一个参数（过 shell，带空格也不散）",
+      plan[0][0][-1] == "claude", plan[0][0][-1])
+
+plan2 = ag.build_tmux_plan(three, "ag", "panes", resume=False, fresh=True)
+check("分屏模式：用 split-window",
+      plan2[1][0][1] == "split-window" and plan2[2][0][1] == "split-window",
+      str([p[0][1] for p in plan2]))
+check("分屏最后会 tiled 排一下",
+      plan2[-1][0][1:3] == ["select-layout", "-t"] and "tiled" in plan2[-1][0],
+      str(plan2[-1][0]))
+
+plan3 = ag.build_tmux_plan([ag.find_entry(reg_t, "cc")], "ag",
+                           "windows", resume=True, fresh=False)
+check("续聊模式带上 resume 参数", plan3[0][0][-1] == "claude --resume",
+      plan3[0][0][-1])
+check("会话已存在时用 new-window", plan3[0][0][1] == "new-window", plan3[0][0][1])
+
+sp_entry = ag.Entry(dict(id="sp", cmd="echo", args=["a b", "c d"]))
+sp_plan = ag.build_tmux_plan([sp_entry], "ag")[0][0][-1]
+check("带空格的参数被正确引用", sp_plan == "echo 'a b' 'c d'", sp_plan)
+check("引用后能还原", shlex.split(sp_plan) == ["echo", "a b", "c d"])
+
+say("  · cmd_team")
+rc, o = runcmd(["team", "--dry-run", "cc", "oc"])
+check("--dry-run 不真跑", rc == 0 and "没真跑" in o, o[:160])
+check("dry-run 里能看到两个短名", "cc" in o and "oc" in o)
+check("dry-run 里能看到真命令", "claude" in o and "opencode" in o)
+rc, o = runcmd(["team", "--dry-run", "--panes", "cc", "oc"])
+check("--panes 反映到输出", "分屏" in o, o[:100])
+rc, o = runcmd(["team", "nosuch"])
+check("不存在的 id 报错", rc != 0)
+
+say("  · tmux 一条都没跑成时不能谎报成功")
+class _FailProc:
+    """假的 subprocess 模块：tmux 一律失败。"""
+    DEVNULL = -3
+    class SubprocessError(Exception): pass
+    @staticmethod
+    def run(*a, **k):
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+ag.shutil = types.SimpleNamespace(
+    which=lambda c: "/usr/local/bin/" + c if c == "tmux" else None,
+    get_terminal_size=lambda d=(100, 24): os.terminal_size((100, 28)))
+ag.subprocess = _FailProc
+try:
+    ag.launch_many = _real_launch_many      # 这条要测真实现，不能用桩
+    rc, o = runcmd(["team", "cc", "oc"])
+    check("全失败时返回非 0", rc != 0, str(rc))
+    check("全失败时不说「✓」", "✓" not in o.split("tmux 一条")[0], o[:200])
+    check("全失败时给出排查提示", "tmux new -s test" in o, o[:300])
+
+    say("  · tmux 报的错要透出来，不能吞掉")
+    class _FailProcErr(_FailProc):
+        @staticmethod
+        def run(*a, **k):
+            return types.SimpleNamespace(
+                returncode=1, stdout="",
+                stderr="create window failed: fork failed: Operation not permitted")
+    ag.subprocess = _FailProcErr
+    ag.launch_many = _real_launch_many
+    rc, o = runcmd(["team", "cc", "oc"])
+    check("把 tmux 的 stderr 打出来了", "fork failed" in o, o[:300])
+    check("认出是权限问题而不是 tmux 坏了",
+          "权限" in o or "沙箱" in o, o[:300])
+finally:
+    ag.shutil = _real_shutil
+    ag.subprocess = _real_subprocess
+    ag.launch_many = _real_launch_many
 
 say()
 say("=" * 64)

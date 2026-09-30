@@ -15,6 +15,7 @@ Put them all behind one fuzzy picker, and add your own by editing one line.
 | 层 | 命令 | 解决什么 |
 |---|---|---|
 | **开哪个** | `ag` / `ag cc` | 十几套启动方式记不住 |
+| **同时开几个** | `ag` 里 Tab 多选 / `ag team` | 一个不够用，还得手动开窗口 |
 | **接着哪个干** | `ag last` / `ag resume` / `Ctrl-R` | 每次都要重新交代上下文 |
 | **翻旧账 / 搬家** | `ag search` / `ag handoff` | 1.8G 会话历史躺着睡觉 |
 | 顺带 | `ag outdated` / `ag update` / `ag stats` / `ag pin` | 批量运维、看习惯 |
@@ -95,6 +96,10 @@ cd agent-gateway
 | **`ag last`** | **接着上次那个 agent、上次那个会话继续** |
 | `ag last --new` | 同上，但开新会话 |
 | **`ag resume [id]`** | **续聊。不带 id 会列出支持续聊的** |
+| **`ag team`** | **多选，一次全开，各占一个 tmux 窗口** |
+| `ag team cc oc goose` | 直接点名几个 |
+| `ag team --panes cc oc` | 用分屏（同屏都能看见） |
+| `ag attach` | 回到之前的 tmux 会话 |
 
 ### 选择器
 
@@ -111,6 +116,7 @@ cd agent-gateway
 | 按键 | 作用 |
 |---|---|
 | 直接打字 | 追加筛选词（**支持中文**） |
+| **`Tab`** | **多选 —— 勾几个，Enter 一次全开** |
 | `↑` `↓` / `Ctrl-P` `Ctrl-N` | 移动 |
 | `PgUp` `PgDn` / `Home` `End` | 翻页 / 跳首尾 |
 | `Backspace` / `Ctrl-U` | 删一字 / 清空 |
@@ -162,6 +168,51 @@ ag deepseek    →  d
 | **`ag search <关键词>`** | **在历史会话里搜**（1.8G 的记录不再躺着睡觉） |
 | **`ag handoff [id]`** | **把最近一次会话整理成交接 prompt，复制到剪贴板** |
 | `ag path` | 打印注册表路径 |
+
+---
+
+## 一次开好几个
+
+一个 agent 不够用的时候：让它跟另一个互相 review、一个写一个查、
+或者干脆几个模型同时上。
+
+```bash
+ag team                 # 多选器：Tab 勾几个，Enter 一次全开
+ag team cc oc goose     # 或者直接点名
+ag team -r cc codex     # 都续聊上次的会话
+ag team --panes cc oc   # 用分屏，同屏都能看见
+```
+
+其实**普通的 `ag` 也支持**：Tab 勾上几个再 Enter 就行。
+
+```
+  ag Agent Gateway  已选 3：cc,oc,goose · 输入即筛选
+  ❯
+  ────────────────────────────────────────────────────────
+  ▣ cc            Claude Code            Anthropic 官方 CLI
+  ▣ oc            OpenCode               开源终端编码 agent
+  ▣ goose         Goose                  Block/aaif 开源 agent
+  ────────────────────────────────────────────────────────
+  ↑↓ 移动 · Enter 一次全开（各占一个窗口） · ...
+```
+
+### 它们跑在哪儿
+
+默认走 **tmux**，一人一个窗口：
+
+- **本来就在 tmux 里** → 直接往你当前会话加窗口，人不用动
+- **不在 tmux 里** → 建一个叫 `ag` 的会话然后 attach 进去
+
+第二种更常用。好处是**关掉终端它们也还活着**：
+
+```bash
+Ctrl-B d        # 脱离，回到普通 shell，agent 继续跑
+ag attach       # 随时回来
+```
+
+没装 tmux 也不会死：macOS 会退化成开几个 Terminal 窗口，其它平台把命令打出来。
+
+> 想看会执行什么：`ag team --dry-run cc oc`
 
 ---
 
