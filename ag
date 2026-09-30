@@ -73,8 +73,8 @@ else:
 # ---------------------------------------------------------------- 数据模型
 
 class Entry:
-    __slots__ = ("id", "name", "cmd", "args", "desc", "tags", "alias",
-                 "env", "cwd", "install", "update", "resume", "hidden", "raw")
+    __slots__ = ("id", "name", "cmd", "args", "desc", "tags", "alias", "env",
+                 "cwd", "install", "update", "resume", "sessions", "hidden", "raw")
 
     def __init__(self, d: dict):
         self.raw = d
@@ -92,6 +92,9 @@ class Entry:
         # resume 是「继续上次会话」的参数，比如 ["--resume"]、["resume"]。
         # 缺省不填就表示这个 agent 不支持续聊，ag resume 会明确告诉你。
         self.resume = [str(a) for a in d.get("resume", [])]
+        # 会话历史目录，给 ag search / ag handoff 用。
+        # 各家格式私有，所以这里只记「去哪找」，解析交给下面的通用提取器。
+        self.sessions = str(d.get("sessions", "")).strip()
         self.hidden = bool(d.get("hidden", False))
 
     @property
@@ -911,6 +914,457 @@ def cmd_pin(entries, args, remove=False):
     return 0
 
 
+# ---------------------------------------------------------------- 会话历史
+#
+# 各家的会话文件格式完全不同、还会变（claude 是
+# ~/.claude/projects/<编码路径>/<uuid>.jsonl，codex 是
+# ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl，……）。
+# 所以这里**不做 per-agent 解析器**，只写一个宽容的通用提取器：
+# 认得出就显示，认不出就少显示一点，绝不因为格式变了就整个崩掉。
+
+def _walk_texts(node, depth=0, budget=None):
+    """按顺序挖出节点里所有像人话的字符串。
+
+    各家格式差别很大：claude 在 message.content[].text，
+    codex 在 payload.content[].text，jcode 在 messages[].content[].text。
+    与其给每家写解析器（格式一变就崩），不如按 key 名宽容地递归找。
+    """
+    if budget is None:
+        budget = [60]
+    if budget[0] <= 0 or depth > 4:
+        return
+    if isinstance(node, str):
+        budget[0] -= 1
+        yield node
+        return
+    if isinstance(node, list):
+        for x in node[:20]:
+            yield from _walk_texts(x, depth + 1, budget)
+        return
+    if not isinstance(node, dict):
+        return
+    # payload 是 codex 的外壳，得钻进去
+    for key in ("payload", "title", "text", "content", "message",
+                "messages", "summary"):
+        if key in node and node[key] is not None:
+            yield from _walk_texts(node[key], depth + 1, budget)
+
+
+# 这些是 agent 自己塞进去的元信息，不是人说的话
+_NOISE = ("Below is a conversation log", "<command-name>", "<local-command",
+          "<system-reminder>", "Caveat:", "You are a", "# AGENTS.md",
+          "Session Context", "<user_info>", "<env>", "<task-notification>",
+          "<output-file>", "<tool-use", "<function_calls>",
+          "Response MUST", "You MUST", "<instructions>", "Always respond")
+
+
+def _prose(s):
+    """像人话吗？用来把终端输出、工具结果、XML 标签挡在外面。
+
+    判据故意粗糙但有效：别以 < 或 shell 提示符开头，别全是符号，
+    长度在合理区间，字母/汉字占比够高。
+    """
+    if not s or len(s) < 8:
+        return None
+    t = " ".join(s.split())
+    if len(t) > 400:
+        t = t[:400]
+    if t.startswith(("<", ">", "$", "%", "│", "┃", "╭", "╰", "```")):
+        return None
+    if any(n in t for n in _NOISE):
+        return None
+    good = sum(1 for ch in t if ch.isalnum() or ch.isspace()
+               or "\u4e00" <= ch <= "\u9fff")
+    if good / max(1, len(t)) < 0.72:
+        return None            # 符号太多，多半是表格/日志/代码
+    # 「🚀 ~ % openclaw update」这类 shell 回显
+    if t.count("%") + t.count("│") + t.count("◇") >= 1:
+        return None
+    return t
+
+
+def _prose_in(node):
+    """从节点里挑第一段像人话的文本。"""
+    for cand in _walk_texts(node):
+        got = _prose(cand)
+        if got:
+            return got
+    return None
+
+
+def _user_text(d):
+    """优先取「用户说的话」，各家的位置不一样。"""
+    if str(d.get("type", "")).lower() == "user":
+        got = _prose_in(d.get("message") or d)
+        if got:
+            return got
+    m = d.get("message")
+    if isinstance(m, dict) and m.get("role") == "user":
+        got = _prose_in(m)
+        if got:
+            return got
+    pay = d.get("payload")
+    if isinstance(pay, dict) and pay.get("role") == "user":
+        got = _prose_in(pay)
+        if got:
+            return got
+    msgs = d.get("messages")           # jcode 这种整份塞一行里的
+    if isinstance(msgs, list):
+        for m in msgs[:12]:
+            if isinstance(m, dict) and m.get("role") == "user":
+                got = _prose_in(m)
+                if got:
+                    return got
+    return None
+
+_CWD_KEYS = ("cwd", "working_dir", "workdir", "project_dir", "projectPath")
+
+
+def _first_cwd(node, depth=0):
+    if depth > 3 or not isinstance(node, dict):
+        return None
+    for k in _CWD_KEYS:
+        v = node.get(k)
+        if isinstance(v, str) and v.startswith("/"):
+            return v
+    for k in ("payload", "session_meta", "meta", "context"):
+        got = _first_cwd(node.get(k), depth + 1)
+        if got:
+            return got
+    return None
+
+
+_CWD_TAG = re.compile(r"<cwd>\s*([^<\s]+)\s*</cwd>")
+
+
+def _cwd_from_text(node):
+    """有的格式不存 cwd，只把环境上下文当文本塞进来。从 <cwd> 标签里捞。"""
+    for cand in _walk_texts(node):
+        m = _CWD_TAG.search(cand)
+        if m and m.group(1).startswith("/"):
+            return m.group(1)
+    return None
+
+
+def session_meta(path, max_lines=300):
+    """通用会话元信息提取：cwd / 标题 / 时间。
+
+    认不出就返回 None，调用方自己决定怎么显示 —— 绝不因为某家格式变了整个崩掉。
+    """
+    cwd = title = ts = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line or '"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue          # 半截行、二进制行，跳过
+                if not isinstance(d, dict):
+                    continue
+                pay = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+                cwd = (cwd or _first_cwd(d) or _first_cwd(pay)
+                       or _cwd_from_text(d))
+                ts = ts or d.get("timestamp") or pay.get("timestamp") \
+                    or d.get("startTime") or d.get("created_at")
+                if title is None:
+                    title = _user_text(d) or _prose_in(d)
+                if cwd and title and ts:
+                    break
+    except OSError:
+        return {"cwd": None, "title": None, "ts": None, "error": True}
+    return {"cwd": cwd, "title": title, "ts": ts}
+
+
+# 子会话 / 派生会话：主会话里派出去的小任务，手交接下来没意义
+_SUB_MARKERS = ("/subagents/", "/sidechain", "/compact", "/tasks/", "/.work-graph")
+
+
+def session_files(e):
+    """某个 agent 的会话文件列表。"""
+    if not e.sessions:
+        return []
+    root = os.path.expanduser(e.sessions)
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for fn in filenames:
+            if not fn.endswith((".jsonl", ".json")):
+                continue
+            full = os.path.join(dirpath, fn)
+            if any(m in full for m in _SUB_MARKERS):
+                continue
+            out.append(full)
+    return out
+
+
+def grep_sessions(paths, keyword):
+    """返回命中的文件集合。优先用 ripgrep（1.8G 历史也就一两秒）。"""
+    if not paths:
+        return set()
+    if shutil.which("rg"):
+        try:
+            r = subprocess.run(
+                ["rg", "-l", "-i", "-F", "--no-messages", "--", keyword, *paths],
+                capture_output=True, text=True, timeout=120)
+            return {ln for ln in r.stdout.splitlines() if ln}
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # 没有 rg 就退回 Python，但只扫尾部若干字节，避免读爆
+    hits = set()
+    needle = keyword.lower().encode()
+    for p in paths:
+        try:
+            size = os.path.getsize(p)
+            with open(p, "rb") as f:
+                if size > 2_000_000:
+                    f.seek(-2_000_000, os.SEEK_END)
+                if needle in f.read().lower():
+                    hits.add(p)
+        except OSError:
+            continue
+    return hits
+
+
+def fmt_session_time(ts):
+    """会话里的 ISO 时间戳 -> 「3 天前」。认不出就返回 ''。"""
+    if not ts:
+        return ""
+    try:
+        s = str(ts).replace("Z", "+00:00")
+        t = time.mktime(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return ""
+    return human_age(t)
+
+
+def short_cwd(cwd):
+    if not cwd:
+        return "?"
+    c = str(cwd)
+    if c.startswith(HOME):
+        c = "~" + c[len(HOME):]
+    return c
+
+
+def cmd_search(entries, args):
+    """在历史会话里搜关键词。"""
+    kw = " ".join(a for a in args if not a.startswith("-"))
+    if not kw:
+        return die("用法：ag search <关键词>")
+    limit = 20
+    for a in args:
+        if a.startswith("--limit="):
+            try:
+                limit = int(a.split("=", 1)[1])
+            except ValueError:
+                pass
+
+    roots = [e for e in entries if e.sessions and not e.hidden]
+    if not roots:
+        return die("没有任何 agent 登记了 sessions 目录（见 ag edit）")
+
+    print(f"\n  {C['gry']}搜索 {len(roots)} 个 agent 的历史会话："
+          f"{kw!r}{C['r']}")
+    all_hits = []
+    for e in roots:
+        files = session_files(e)
+        if not files:
+            continue
+        hits = grep_sessions(files, kw)
+        for h in hits:
+            all_hits.append((os.path.getmtime(h), e, h))
+        if hits:
+            print(f"    {C['b']}{pad(e.id, 12)}{C['r']} "
+                  f"{C['grn']}{len(hits)}{C['r']} {C['gry']}/{len(files)} 个会话命中{C['r']}")
+
+    if not all_hits:
+        print(f"\n  {C['yel']}没搜到。{C['r']}"
+              f"{C['gry']}换个关键词试试，或者那个 agent 还没登记 sessions{C['r']}\n")
+        return 0
+
+    all_hits.sort(reverse=True, key=lambda t: t[0])
+    print(f"\n  {C['b']}命中 {len(all_hits)} 个会话"
+          f"{f'，显示最近 {limit} 个' if len(all_hits) > limit else ''}：{C['r']}\n")
+    for _, e, path in all_hits[:limit]:
+        meta = session_meta(path, max_lines=120)
+        when = fmt_session_time(meta.get("ts")) or human_age(os.path.getmtime(path))
+        print(f"  {C['b']}{pad(e.id, 10)}{C['r']} "
+              f"{C['gry']}{when:>10}{C['r']}  "
+              f"{C['cyn']}{trunc(short_cwd(meta.get('cwd')), 34)}{C['r']}")
+        if meta.get("title"):
+            print(f"            {C['gry']}{trunc(meta['title'], 78)}{C['r']}")
+        print(f"            {C['gry']}{trunc(short_home(path), 78)}{C['r']}")
+    print(f"\n  {C['gry']}想接着聊：{C['cyn']}ag resume <id>{C['r']}"
+          f"{C['gry']}（会话选择器里挑对应那条）{C['r']}\n")
+    return 0
+
+
+def short_home(p):
+    return "~" + p[len(HOME):] if p.startswith(HOME) else p
+
+
+# ---------------------------------------------------------------- 交接
+
+def latest_session(e):
+    """某个 agent 最近改动过的那个会话文件。"""
+    files = session_files(e)
+    if not files:
+        return None
+    return max(files, key=lambda p: os.path.getmtime(p))
+
+
+def session_tail(path, turns=6, max_chars=600):
+    """抓会话末尾若干轮对话。宽容解析，认不出就少给点。"""
+    msgs = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or '"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                pay = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+                role = (d.get("type") or pay.get("type") or "").lower()
+                if role not in ("user", "assistant", "response_item", "message",
+                                "event_msg"):
+                    continue
+                # developer / system 是塞给模型的指令，不是人说的话
+                r2 = str(pay.get("role") or "").lower()
+                if r2 in ("developer", "system", "tool"):
+                    continue
+                txt = _prose_in(d)
+                if not txt:
+                    continue
+                who = "assistant" if "assist" in role or pay.get("role") == "assistant" \
+                    else "user"
+                if isinstance(pay.get("role"), str):
+                    who = pay["role"]
+                txt = " ".join(txt.split())
+                msgs.append((who, txt[:max_chars]))
+    except OSError:
+        return []
+
+    # 同一个角色的连续消息合并，别出现 user/user/user
+    merged = []
+    for who, txt in msgs:
+        if merged and merged[-1][0] == who:
+            merged[-1] = (who, merged[-1][1] + "\n" + txt)
+        else:
+            merged.append((who, txt))
+    return merged[-turns:]
+
+
+def cmd_handoff(entries, args):
+    """把最近一次会话的上下文整理成一段 prompt，塞进剪贴板。
+
+    场景：在 Claude Code 里聊到一半，想换 Codex 接着干。
+    """
+    src_id = None
+    rest = []
+    for a in args:
+        if not a.startswith("-") and src_id is None and find_entry(entries, a):
+            src_id = a
+        else:
+            rest.append(a)
+
+    if src_id:
+        e = find_entry(entries, src_id)
+    else:
+        lid = last_used_id()
+        e = find_entry(entries, lid) if lid else None
+        if e is None:
+            return die("不知道从哪个 agent 接。用法：ag handoff <id>")
+
+    if not e.sessions:
+        return die(f"「{e.id}」没有登记 sessions 目录，读不到它的会话历史")
+
+    files = sorted(session_files(e), key=os.path.getmtime, reverse=True)
+    if not files:
+        return die(f"在 {e.sessions} 里没找到任何会话文件")
+
+    # 最近的那个未必有内容（可能只是个自动化的空跑），往前多试几个
+    path, tail, tried = None, [], 0
+    for cand in files[:8]:
+        tried += 1
+        got = session_tail(cand, turns=8)
+        if got:
+            path, tail = cand, got
+            break
+    if not path:
+        return die(f"最近 {tried} 个会话里都没找到可提取的对话"
+                   f"（可能是自动化跑的空会话）。换个 agent 试试，"
+                   f"或用 ag search 找找看")
+
+    meta = session_meta(path, max_lines=120)
+    cwd = meta.get("cwd") or os.getcwd()
+
+    lines = [
+        f"# 交接：从 {e.name} 继续",
+        "",
+        f"我原本在用 **{e.name}**（`{e.id}`）处理一个任务，现在换你来接手。",
+        f"工作目录：`{cwd}`",
+        "",
+        "以下是那个会话最近的对话记录，请先读懂上下文，再继续把活干完。",
+        "不要复述上面的内容，直接接着做。",
+        "",
+        "---",
+        "",
+    ]
+    for who, txt in tail:
+        lines.append(f"**{who}**：{txt}")
+        lines.append("")
+
+    prompt = "\n".join(lines)
+
+    if "--print" in rest or "-p" in rest:
+        # 提示走 stderr，stdout 保持干净好管道给别的命令
+        if tried > 1:
+            print(f"（跳过了 {tried - 1} 个没内容的会话）", file=sys.stderr)
+        print(prompt)
+        return 0
+
+    copied = False
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, input=prompt.encode("utf-8"), check=True, timeout=10)
+            copied = True
+            break
+        except (OSError, subprocess.SubprocessError):
+            continue
+
+    skipped = f"，跳过了 {tried - 1} 个没内容的" if tried > 1 else ""
+    print(f"\n  {C['grn']}✓ 交接 prompt 已生成{C['r']}"
+          f"  {C['gry']}（来源：{e.id} · {len(tail)} 轮 · "
+          f"{len(prompt)} 字{skipped}）{C['r']}")
+    print(f"  {C['gry']}工作目录：{short_cwd(cwd)}{C['r']}")
+    for who, txt in tail[-3:]:
+        print(f"    {C['gry']}{who}: {trunc(txt, 70)}{C['r']}")
+    if copied:
+        print(f"\n  {C['grn']}已复制到剪贴板{C['r']} "
+              f"{C['gry']}—— 切到目标 agent 粘一下就行{C['r']}")
+    else:
+        print(f"\n  {C['yel']}没找到剪贴板工具{C['r']}"
+              f"{C['gry']}，用 {C['cyn']}ag handoff {e.id} --print{C['r']}"
+              f"{C['gry']} 直接打出来{C['r']}")
+    print(f"  {C['gry']}下一步：{C['cyn']}ag <目标agent>{C['r']}"
+          f"{C['gry']} 然后粘贴{C['r']}\n")
+    return 0
+
+
 # ---------------------------------------------------------------- 批量升级
 
 NPM_RE = re.compile(r"\bnpm\s+(?:i|install|add)\s+(?:-g|--global)\s+([^\s;&|]+)")
@@ -1237,6 +1691,8 @@ def render_toml(e: Entry):
         L.append(f"update = {toml_str(e.update)}")
     if e.resume:
         L.append(f"resume = {toml_arr(e.resume)}")
+    if e.sessions:
+        L.append(f"sessions = {toml_str(e.sessions)}")
     if e.hidden:
         L.append("hidden = true")
     return "\n".join(L) + "\n"
@@ -1433,6 +1889,10 @@ def usage():
     ag unpin <id...>      取消置顶
     ag stats [--history]  使用统计 / 最近启动时间线
 
+  {C['b']}翻历史{C['r']}
+    ag search <关键词>     在历史会话里搜（需要注册表登记 sessions 目录）
+    ag handoff [id]       把最近一次会话整理成交接 prompt，复制到剪贴板
+
   {C['b']}升级{C['r']}
     ag outdated           看哪些有新版本（npm / brew 能查的都查）
     ag update [id...]     升级。不带 id 会先列出命令再问一次
@@ -1487,7 +1947,9 @@ def main(argv):
            "pin": cmd_pin, "unpin": lambda es, ar: cmd_pin(es, ar, remove=True),
            "stats": cmd_stats,
            "update": cmd_update, "upgrade": cmd_update, "up": cmd_update,
-           "outdated": cmd_outdated, "old": cmd_outdated}
+           "outdated": cmd_outdated, "old": cmd_outdated,
+           "search": cmd_search, "find": cmd_search, "s": cmd_search,
+           "handoff": cmd_handoff, "ho": cmd_handoff}
 
     if a and a[0] in sub:
         return sub[a[0]](entries, a[1:])

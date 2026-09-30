@@ -150,6 +150,8 @@ ag deepseek    →  d
 | `ag unpin <id...>` | 取消置顶 |
 | `ag stats` | 使用统计（含 frecency 柱状图） |
 | `ag stats --history` | 最近启动的时间线 |
+| **`ag search <关键词>`** | **在历史会话里搜**（1.8G 的记录不再躺着睡觉） |
+| **`ag handoff [id]`** | **把最近一次会话整理成交接 prompt，复制到剪贴板** |
 | `ag path` | 打印注册表路径 |
 
 ---
@@ -200,6 +202,72 @@ resume = ["session", "--resume"]   # 更长的，如 goose
     goose      21 次 ·    3 天前  ▇▇▇▇ Goose
     kimi        9 次 ·   2 周前  ▇▇ Kimi Code
 ```
+
+---
+
+## 翻历史
+
+装了十几个 agent，历史会话散在十几个私有格式的目录里，加起来 1.8G。
+`ag` 把它们变成能用的东西。
+
+### 搜
+
+```bash
+ag search 登录页           # 我记得上周让某个 agent 改过，但忘了是哪个
+```
+
+```
+  搜索 4 个 agent 的历史会话：'公众号'
+    cc           40 /51 个会话命中
+    codex        77 /84 个会话命中
+    j            32 /91 个会话命中
+
+  命中 149 个会话，显示最近 8 个：
+
+  cc             10 小时前  ~/projects/foo
+            OpenClaw 升级在 validating 阶段被拒，triage 也没跑起来…
+            ~/.claude/projects/-Users-yudengcheng/23451c59-….jsonl
+```
+
+`ag search` 走 ripgrep，扫完 4 个 agent 约 **1.8 秒**。找到之后 `ag resume <id>`
+就能接着聊。
+
+### 交接
+
+```bash
+ag handoff          # 从最近用过的 agent 交接
+ag handoff cc       # 指定从 Claude Code 交接
+```
+
+它会读那个 agent **最近一次会话**的最后 8 轮对话，加上工作目录，
+生成一段 prompt 塞进剪贴板。你切到另一个 agent 粘一下就行。
+
+场景：在 Claude Code 里聊到一半发现 Codex 更合适，不用把那堆上下文重新讲一遍。
+
+> 加 `--print` 直接打出来（没装剪贴板工具时用）。
+
+### 怎么做到的
+
+**不给每家写解析器。** 各家会话格式完全不同（claude 是
+`<编码路径>/<uuid>.jsonl`，codex 是 `YYYY/MM/DD/rollout-*.jsonl`，
+jcode 干脆是整份塞一个 `.json` 里），私有、还会变。所以 `ag` 只做两件事：
+
+1. 注册表里用 `sessions` 字段记「去哪找」
+2. 用一个**宽容的通用提取器**挖 `cwd` / 标题 / 对话：按 key 名递归找
+   `text` / `content` / `message` / `messages` / `payload`，
+   再用一组启发式（长度、符号占比、XML 标签、shell 回显）把噪音挡掉
+
+认得出就显示，认不出就少显示一点，**绝不因为某家改了格式就整个崩掉**。
+
+想给自己的 agent 加上：
+
+```toml
+sessions = "~/.youragent/sessions"
+```
+
+示例注册表里已填好 4 个（`cc` `codex` `gemini` `j`），都是实测确认过目录里
+确实是会话记录的 —— 像 `~/.grok/memtrace`、`~/.codewhale/telemetry`
+那些是调试数据，看着像但不是，就没收。
 
 ---
 

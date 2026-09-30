@@ -381,6 +381,19 @@ check("帮助面板里不会误启动", "launched" not in got)
 
 say()
 say("14) 子命令：pin / unpin / last / stats")
+def runcmd_err(args):
+    """跟 runcmd 一样，但把 stderr 也返回 —— 用于检查提示信息。"""
+    buf, err = io.StringIO(), io.StringIO()
+    saved = ag.sys.stdout, ag.sys.stderr, ag.sys.argv
+    ag.sys.stdout, ag.sys.stderr = buf, err
+    ag.sys.argv = ["ag", *args]
+    try:
+        rc = ag.main(ag.sys.argv)
+    finally:
+        ag.sys.stdout, ag.sys.stderr, ag.sys.argv = saved
+    return rc, buf.getvalue(), err.getvalue()
+
+
 def runcmd(args, expect_rc=None):
     buf, err = io.StringIO(), io.StringIO()
     saved = ag.sys.stdout, ag.sys.stderr, ag.sys.argv
@@ -496,6 +509,166 @@ try:
 finally:
     ag.REGISTRY = saved_reg
     shutil.rmtree(UPD_DIR, ignore_errors=True)
+
+say()
+say("16) 会话搜索与交接")
+SESS_DIR = tempfile.mkdtemp(prefix="ag-sess-")
+
+def w(rel, lines):
+    full = os.path.join(SESS_DIR, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as fh:
+        for l in lines:
+            fh.write(json.dumps(l, ensure_ascii=False) + "\n")
+    return full
+
+# 三种真实格式的迷你复刻
+CLAUDE = [
+    {"type": "queue-operation", "timestamp": "2026-09-01T10:00:00Z",
+     "content": "🚀 ~ % npm test │ ◇ Phase: running"},
+    {"type": "user", "cwd": "/Users/me/proj-a", "timestamp": "2026-09-01T10:00:05Z",
+     "message": {"role": "user",
+                 "content": [{"type": "text", "text": "<system-reminder>ignored</system-reminder>"}]}},
+    {"type": "user", "cwd": "/Users/me/proj-a", "timestamp": "2026-09-01T10:00:09Z",
+     "message": {"role": "user",
+                 "content": [{"type": "text", "text": "帮我修复登录页的样式问题"}]}},
+    {"type": "assistant", "timestamp": "2026-09-01T10:00:20Z",
+     "message": {"role": "assistant",
+                 "content": [{"type": "text", "text": "先看一下 LoginPage 组件的样式定义"}]}},
+]
+CODEX = [
+    {"type": "session_meta", "payload": {"cwd": "/Users/me/proj-b",
+                                         "session_id": "abc"},
+     "timestamp": "2026-09-02T11:00:00Z"},
+    {"type": "response_item", "payload": {"role": "user",
+                                          "content": [{"type": "text", "text": "给这个接口加上重试"}]}},
+    {"type": "response_item", "payload": {"role": "assistant",
+                                          "content": [{"type": "text", "text": "用指数退避实现"}]}},
+]
+JCODE = [{"id": "session_x", "title": None, "working_dir": "/Users/me/proj-c",
+          "created_at": "2026-09-03T12:00:00Z",
+          "messages": [
+              {"role": "user", "content": [{"type": "text", "text": "数据库迁移脚本写一下"}]},
+              {"role": "assistant", "content": [{"type": "text", "text": "用 alembic 生成"}]},
+          ]}]
+
+w("cc/s1.jsonl", CLAUDE)
+w("cc/subagents/s2.jsonl", CLAUDE)          # 子会话，应被过滤
+w("codex/s3.jsonl", CODEX)
+w("j/s4.json", JCODE)
+
+REG2 = os.path.join(SESS_DIR, "registry.toml")
+with open(REG2, "w", encoding="utf-8") as fh:
+    fh.write(f'''
+[[agent]]
+id = "cc"
+name = "Claude Code"
+cmd = "echo"
+resume = ["--resume"]
+sessions = "{SESS_DIR}/cc"
+
+[[agent]]
+id = "codex"
+name = "Codex"
+cmd = "echo"
+resume = ["resume"]
+sessions = "{SESS_DIR}/codex"
+
+[[agent]]
+id = "j"
+name = "JCode"
+cmd = "echo"
+sessions = "{SESS_DIR}/j"
+''')
+
+saved_reg = ag.REGISTRY
+ag.REGISTRY = REG2
+try:
+    ents = ag.load_registry()
+
+    say("  · session_files 会过滤子会话")
+    cc = ag.find_entry(ents, "cc")
+    files = ag.session_files(cc)
+    check("子会话被排除", len(files) == 1 and "subagents" not in files[0], str(files))
+
+    say("  · 三种格式都能提取 cwd / 标题")
+    m1 = ag.session_meta(os.path.join(SESS_DIR, "cc/s1.jsonl"))
+    check("claude: cwd", m1["cwd"] == "/Users/me/proj-a", str(m1))
+    check("claude: 取到用户说的话（跳过 system-reminder 和终端回显）",
+          m1["title"] == "帮我修复登录页的样式问题", repr(m1["title"]))
+    m2 = ag.session_meta(os.path.join(SESS_DIR, "codex/s3.jsonl"))
+    check("codex: cwd 在 payload 里也能拿到", m2["cwd"] == "/Users/me/proj-b", str(m2))
+    check("codex: 标题", m2["title"] == "给这个接口加上重试", repr(m2["title"]))
+    m3 = ag.session_meta(os.path.join(SESS_DIR, "j/s4.json"))
+    check("jcode: 读 working_dir", m3["cwd"] == "/Users/me/proj-c", str(m3))
+    check("jcode: 从 messages 里挖出用户消息",
+          m3["title"] == "数据库迁移脚本写一下", repr(m3["title"]))
+
+    say("  · _prose 挡得住噪音")
+    for bad in ["<task-notification>x</task-notification>", "🚀 ~ % openclaw update │ ◇",
+                "│ col1 │ col2 │", "```python", "$ ls -la"]:
+        check(f"拒绝 {bad[:24]!r}", ag._prose(bad) is None, repr(ag._prose(bad)))
+    check("放行正常中文", ag._prose("帮我修复登录页的样式问题") is not None)
+    check("过短的拒绝", ag._prose("ok") is None)
+
+    say("  · session_tail 合并连续同角色")
+    tail = ag.session_tail(os.path.join(SESS_DIR, "cc/s1.jsonl"))
+    roles = [r for r, _ in tail]
+    check("角色交替，无连续重复", all(roles[i] != roles[i + 1] for i in range(len(roles) - 1)),
+          str(roles))
+    check("抓到内容", any("登录页" in t for _, t in tail), str(tail))
+
+    say("  · ag search")
+    rc, o = runcmd(["search", "登录页"])
+    check("搜得到", rc == 0 and "命中" in o, o[:200])
+    check("显示了 cwd", "proj-a" in o, o[:300])
+    rc, o = runcmd(["search", "绝对不存在的词zzz"])
+    check("搜不到时明确说没搜到", rc == 0 and "没搜到" in o, o[:200])
+    rc, o = runcmd(["search"])
+    check("不给关键词会报用法", rc != 0)
+
+    say("  · ag handoff")
+    rc, o = runcmd(["handoff", "cc", "--print"])
+    check("生成交接 prompt", rc == 0 and "交接" in o and "Claude Code" in o, o[:200])
+    check("带上了工作目录", "proj-a" in o)
+    check("带上了对话内容", "登录页" in o)
+    check("明确要求接着做、别复述", "不要复述" in o)
+    rc, o = runcmd(["handoff", "codex", "--print"])
+    check("从 codex 也能交接", rc == 0 and "重试" in o, o[:200])
+    rc, o = runcmd(["handoff", "nosuch", "--print"])
+    check("不存在的 agent 报错", rc != 0)
+
+    # 没登记 sessions 的 agent 要给出明确提示，而不是静默失败
+    with open(REG2, "a", encoding="utf-8") as fh:
+        fh.write('''
+[[agent]]
+id = "nosess"
+name = "没登记会话目录"
+cmd = "echo"
+''')
+    ents2 = ag.load_registry()
+    ag.REGISTRY = REG2
+    rc, o = runcmd(["handoff", "nosess", "--print"])
+    check("没登记 sessions 时明确报错", rc != 0, o[:120])
+
+    say("  · 最近的会话没内容时，自动往前找")
+    # 造一个「更新时间最新、但里面只有系统噪音」的会话
+    import time as _t
+    empty = w("cc/s9.jsonl", [
+        {"type": "user", "cwd": "/Users/me/proj-a", "timestamp": "2026-09-09T10:00:00Z",
+         "message": {"role": "user", "content": [
+             {"type": "text", "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n"
+                                       "每次开始任何任务前先读取记忆库</INSTRUCTIONS>"}]}},
+    ])
+    os.utime(empty, (_t.time() + 100, _t.time() + 100))   # 保证它是最新的
+    rc, o, e = runcmd_err(["handoff", "cc", "--print"])
+    check("跳过了没内容的会话（提示走 stderr，stdout 保持干净）",
+          rc == 0 and "跳过" in e, repr(e))
+    check("stdout 里只有 prompt 本身", "跳过" not in o, o[:120])
+    check("拿到的是有对话的那个", "登录页" in o, o[:300])
+finally:
+    ag.REGISTRY = saved_reg
+    shutil.rmtree(SESS_DIR, ignore_errors=True)
 
 say()
 say("=" * 64)
