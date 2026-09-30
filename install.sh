@@ -18,8 +18,10 @@ RAW="${AG_RAW_BASE:-https://raw.githubusercontent.com/yudch999-bot/agent-gateway
 BIN_DIR="$HOME/.local/bin"
 AG_DIR="$HOME/.agents"
 ZSHRC="$HOME/.zshrc"
-MARK_BEGIN="# >>> ag — Agent Gateway >>>"
-MARK_END="# <<< ag — Agent Gateway <<<"
+# 检测用「前缀」：容忍标记行后面还跟着说明文字（老版本写的就带说明）
+MARK_KEY="# >>> ag — Agent Gateway"
+BLOCK_BEGIN="# >>> ag — Agent Gateway >>>"
+BLOCK_END="# <<< ag — Agent Gateway <<<"
 
 c_ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 c_info() { printf '\033[90m·\033[0m %s\n' "$*"; }
@@ -48,9 +50,9 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   [ -f "$SRC_DIR/ag" ] || SRC_DIR=""
 fi
 if [ -n "$SRC_DIR" ]; then
-  c_info "源文件：$SRC_DIR（本地仓库）"
+  c_info "源文件：${SRC_DIR}（本地仓库）"
 else
-  c_info "源文件：$RAW（远程下载）"
+  c_info "源文件：${RAW}（远程下载）"
   command -v curl >/dev/null 2>&1 || c_die "需要 curl 才能远程安装"
 fi
 
@@ -84,12 +86,12 @@ fetch ag.zsh "$AG_DIR/ag.zsh"
 c_ok "zsh 集成：$AG_DIR/ag.zsh（Tab 补全 + Ctrl-G）"
 
 # ---------- 6. 接进 .zshrc（幂等）----------
-BLOCK="$MARK_BEGIN
+BLOCK="$BLOCK_BEGIN
 export PATH=\"\$HOME/.local/bin:\$PATH\"
 [[ -r \"\$HOME/.agents/ag.zsh\" ]] && source \"\$HOME/.agents/ag.zsh\"
-$MARK_END"
+$BLOCK_END"
 
-if [ -f "$ZSHRC" ] && grep -qF "$MARK_BEGIN" "$ZSHRC"; then
+if [ -f "$ZSHRC" ] && grep -qF "$MARK_KEY" "$ZSHRC"; then
   c_info ".zshrc 里已有 ag 段落，跳过"
 else
   if [ -f "$ZSHRC" ]; then
