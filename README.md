@@ -98,7 +98,8 @@ cd agent-gateway
 | **`ag resume [id]`** | **续聊。不带 id 会列出支持续聊的** |
 | **`ag team`** | **多选，一次全开，各占一个 tmux 窗口** |
 | `ag team cc oc goose` | 直接点名几个 |
-| `ag team --panes cc oc` | 用分屏（同屏都能看见） |
+| `ag team --grid 3x2 …` | 指定宫格形状（默认自动） |
+| `ag team --windows …` | 不开宫格，一人一个 tmux 窗口 |
 | `ag attach` | 回到之前的 tmux 会话 |
 | **`ag ps`** | **看现在有哪些 agent 在跑** |
 | **`ag kill [id...]`** | **关掉指定的窗口**（不带参数会列出让你挑） |
@@ -217,11 +218,53 @@ ag team --panes cc oc   # 用分屏，同屏都能看见
   ↑↓ 移动 · Enter 一次全开（各占一个窗口） · ...
 ```
 
+### 宫格（默认）
+
+选多个之后，**把当前这一个终端切成宫格**，一格一个 agent，同屏全看得见：
+
+```bash
+ag team                 # 多选器（Tab 勾选），不用带任何参数
+ag team cc oc goose     # 直接点名
+```
+
+形状是自动算的，**偏宽**（终端本来就宽扁）：
+
+| 几个 | 形状 | | 几个 | 形状 |
+|---|---|---|---|---|
+| 2 | 2×1 左右并排 | | 6 | 3×2 |
+| 3 | 3×1 三列 | | 8 | 4×2 |
+| 4 | 2×2 | | 9 | 3×3 |
+
+想指定就加参数：
+
+```bash
+ag team --grid 3x2 cc oc goose codex kimi gemini    # 3 列 2 行
+ag team --cols 3  （六个 id）                        # 只指定列数
+ag team --windows cc oc                             # 不开宫格，一人一个 tmux 窗口
+```
+
+`--windows` 是老的用法：一个 agent 一个 tmux 窗口，用 `Ctrl-B n/p` 切。
+**格子太小时 `ag` 会提醒你** —— agent 的界面需要横向空间，
+每格小于约 56×12 就不太好用了，这时候建议换 `--windows`。
+
+<details>
+<summary>宫格和窗口分别怎么切</summary>
+
+| 操作 | 宫格 | 窗口 |
+|---|---|---|
+| 换焦点 | `Ctrl-B` 方向键 | `Ctrl-B n/p` 或数字 |
+| 放大当前格 | `Ctrl-B z`（再按还原） | — |
+| 脱离（后台继续跑） | `Ctrl-B d` | `Ctrl-B d` |
+| 回来 | `ag attach` | `ag attach` |
+
+两种布局下，关掉终端它们都还活着。
+</details>
+
 ### 它们跑在哪儿
 
-默认走 **tmux**，一人一个窗口：
+默认走 **tmux**：
 
-- **本来就在 tmux 里** → 直接往你当前会话加窗口，人不用动
+- **本来就在 tmux 里** → 直接往你当前会话里切，人不用动
 - **不在 tmux 里** → 建一个叫 `ag` 的会话然后 attach 进去
 
 第二种更常用。好处是**关掉终端它们也还活着**：

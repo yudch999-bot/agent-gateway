@@ -54,7 +54,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -534,34 +534,126 @@ def terminal_fallback(entries, resume=False):
     return 1
 
 
-def build_tmux_plan(entries, sess, layout="windows", resume=False, fresh=True):
-    """算出要跑哪些 tmux 命令。纯函数，不执行 —— 方便测。"""
-    plan = []
-    for i, e in enumerate(entries):
-        argv = e.resume_argv() if resume else e.argv()
-        cwd = os.path.expanduser(e.cwd) if e.cwd else os.getcwd()
-        if not os.path.isdir(cwd):
-            cwd = os.getcwd()
-        if i == 0 and fresh:
-            base = ["new-session", "-d", "-s", sess]
-        elif layout == "panes":
-            base = ["split-window", "-t", sess]
-        else:
-            base = ["new-window", "-t", sess]
-        # 命令整条作为一个参数交给 tmux，它再过 shell —— 
-        # 这样带空格的参数也不会散架，也不用纠结 tmux 的 -- 语义
-        plan.append((["tmux", *base, "-n", e.id, "-c", cwd,
-                      shlex.join(argv)], e))
+GRID_RE = re.compile(r"^(\d+)\s*[x×*]\s*(\d+)$", re.I)
+
+
+def parse_grid(spec):
+    """'3x2' / '3*2' / '2X2' -> (列数, 行数)。认不出返回 None。"""
+    m = GRID_RE.match((spec or "").strip())
+    if not m:
+        return None
+    c, r = int(m.group(1)), int(m.group(2))
+    return (c, r) if c >= 1 and r >= 1 else None
+
+
+def auto_grid(n, cols=None):
+    """按数量猜宫格形状，返回 (列数, 行数)。
+
+    终端是宽扁的（100 列 × 30 行很常见），字符本身也高比宽大，
+    所以宫格要**偏宽**才显得方正：2 个左右并排、3 个三列、4 个 2×2、
+    6 个 3×2、8 个 4×2、9 个 3×3。
+
+    打分 = 空格子数 × 2 + |列/行 - 2| + （竖的比横的长就重罚 10）
+    格子数优先（空格子难看），其次形状；一列叠到底那种永远不要。
+    """
+    if n <= 1:
+        return (1, 1)
+    if cols:
+        return (cols, -(-n // cols))          # 向上取整
+    best, best_score = (n, 1), None
+    for c in range(1, n + 1):
+        r = -(-n // c)
+        waste = c * r - n
+        score = waste * 2 + abs(c / r - 2.0) + (10 if r > c else 0)
+        if best_score is None or score < best_score:
+            best, best_score = (c, r), score
+    return best
+
+
+def build_tmux_plan(entries, sess, layout="grid", resume=False, fresh=True,
+                    grid=None):
+    """算出要跑哪些 tmux 命令。纯函数，不执行 —— 方便测。
+
+    layout:
+      grid     把当前窗口切成宫格，一格一个 agent（默认）
+      windows  一个 agent 一个 tmux 窗口，用 Ctrl-B n/p 切
+      panes    grid 的别名（老写法）
+
+    返回 [(argv, entry, target)]：
+      target 是 None 或 "@k" —— 表示这条命令要打在「第 k 步捕获到的 pane id」上。
+      宫格要靠 pane id 精确定位，边建边把 id 记下来。
+    """
     if layout == "panes":
-        plan.append((["tmux", "select-layout", "-t", sess, "tiled"], None))
+        layout = "grid"
+
+    def cmd_of(e):
+        return shlex.join(e.resume_argv() if resume else e.argv())
+
+    def cwd_of(e):
+        d = os.path.expanduser(e.cwd) if e.cwd else os.getcwd()
+        return d if os.path.isdir(d) else os.getcwd()
+
+    if layout == "windows":
+        plan = []
+        for i, e in enumerate(entries):
+            base = (["new-session", "-d", "-s", sess] if (i == 0 and fresh)
+                    else ["new-window", "-t", sess])
+            plan.append((["tmux", *base, "-n", e.id, "-c", cwd_of(e), cmd_of(e)],
+                         e, None))
+        return plan
+
+    # ---- 宫格 ----
+    n = len(entries)
+    cols, rows = grid or auto_grid(n)
+    if cols * rows < n:                      # 给的格子不够，补列
+        cols = -(-n // rows)
+
+    plan = []
+    # 第一格：建会话。用 -P -F 把新 pane 的 id 打出来，后面靠它定位
+    first = entries[0]
+    plan.append((["tmux", "new-session", "-d", "-s", sess, "-n", "ag",
+                  "-c", cwd_of(first), "-P", "-F", "#{pane_id}", cmd_of(first)],
+                 first, None))                       # 捕获 -> @0
+
+    # 铺第一行：往右切，切出 cols 列
+    for c in range(1, cols):
+        if c >= n:
+            break
+        e = entries[c]
+        plan.append((["tmux", "split-window", "-h", "-t", "@0",
+                      "-c", cwd_of(e), "-P", "-F", "#{pane_id}", cmd_of(e)],
+                     e, f"@{c - 1}"))                # 捕获 -> @c
+
+    created = min(cols, n)
+    # 每一列往下切 rows-1 刀
+    for r in range(1, rows):
+        for c in range(cols):
+            if created >= n:
+                break
+            e = entries[created]
+            # 这一列当前最下面那格：第一行是 @c，之后是 @(cols + (r-1)*cols + c)
+            prev = c if r == 1 else cols + (r - 2) * cols + c
+            plan.append((["tmux", "split-window", "-v", "-t", f"@{prev}",
+                          "-c", cwd_of(e), "-P", "-F", "#{pane_id}", cmd_of(e)],
+                         e, f"@{prev}"))
+            created += 1
+
+    # 别让 tmux 自作主张重排
+    plan.append((["tmux", "select-layout", "-t", sess, "tiled"], None, None))
+    # 别把状态栏顶掉（格子小的时候状态栏很占地方）
+    plan.append((["tmux", "set-option", "-t", sess, "pane-border-status", "top"],
+                 None, None))
     return plan
 
 
-def launch_many(entries, layout="windows", resume=False, session=None):
-    """一次拉起多个 agent，每个占一个 tmux 窗口（或分屏）。
+def launch_many(entries, layout="grid", resume=False, session=None, grid=None):
+    """一次拉起多个 agent。
 
-    在 tmux 里 → 往当前会话加窗口，人不用动
-    不在 tmux 里 → 建一个会话再 attach 进去；关掉终端它们也还活着
+    layout="grid"（默认）把当前窗口切成宫格，一格一个，同屏都看得见。
+    layout="windows" 一个 agent 一个 tmux 窗口，用 Ctrl-B n/p 切。
+
+    在 tmux 里 → 往当前会话里加；不在 → 建一个会话再 attach 进去，
+    好处是关掉终端它们也还活着。
     """
     tmux = shutil.which("tmux")
     if not tmux:
@@ -571,19 +663,35 @@ def launch_many(entries, layout="windows", resume=False, session=None):
     sess = session or inside or "ag"
     fresh = not session_exists(tmux, sess)
 
-    plan = build_tmux_plan(entries, sess, layout, resume, fresh)
-    ran, failed, errs = [], [], []
-    for argv, e in plan:
+    # 格子太小就没法用了，先提醒一声
+    if layout != "windows" and len(entries) > 1:
+        cols, rows = grid or auto_grid(len(entries))
+        cols = max(1, cols)
+        rows = max(1, -(-len(entries) // cols) if not grid else rows)
+        W, H = shutil.get_terminal_size((100, 30))
+        pw, ph = W // max(1, cols), H // max(1, rows)
+        if pw < 56 or ph < 12:
+            print(f"  {C['yel']}!{C['r']} 每格大约 {pw}×{ph}，agent 的界面可能挤。"
+                  f"{C['gry']}嫌挤可以用 {C['cyn']}ag team --windows "
+                  f"{' '.join(e.id for e in entries[:3])}…{C['r']}")
+
+    plan = build_tmux_plan(entries, sess, layout, resume, fresh, grid=grid)
+    captured, ran, failed, errs = {}, [], [], []
+    for step, (argv, e, target) in enumerate(plan):
+        if target and target in captured:
+            argv = [captured[target] if a == target else a for a in argv]
         try:
-            # stderr 一定要收着 —— 不然 tmux 失败了用户完全看不出为什么
             r = subprocess.run(argv, check=False, capture_output=True, text=True)
-            rc, err = r.returncode, (r.stderr or "").strip()
+            rc, out, err = r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
         except OSError as ex:
-            rc, err = 1, str(ex)
+            rc, out, err = 1, "", str(ex)
+
         if e is None:
             continue
         if rc == 0:
             ran.append(e)
+            if out:
+                captured[f"@{step}"] = out      # -P -F 打回来的 pane id
         else:
             failed.append(e)
             if err and err not in errs:
@@ -609,9 +717,12 @@ def launch_many(entries, layout="windows", resume=False, session=None):
         except Exception:
             pass
 
-    tag = "分屏" if layout == "panes" else "窗口"
-    print(f"\n  {C['grn']}✓{C['r']} {C['b']}{len(ran)}{C['r']} 个 agent，"
-          f"一人一个 tmux {tag}：")
+    if layout == "windows":
+        what = f"{len(ran)} 个 tmux 窗口"
+    else:
+        c, r = grid or auto_grid(len(ran))
+        what = f"{c}×{r} 宫格"
+    print(f"\n  {C['grn']}✓{C['r']} {C['b']}{len(ran)}{C['r']} 个 agent，{what}：")
     for e in ran:
         argv = e.resume_argv() if resume else e.argv()
         mark = f" {C['mag']}↻{C['r']}" if resume else ""
@@ -624,19 +735,15 @@ def launch_many(entries, layout="windows", resume=False, session=None):
             print(f"    {C['gry']}{trunc(err, 74)}{C['r']}")
 
     if inside:
-        try:
-            subprocess.run([tmux, "select-window", "-t", f"{sess}:{ran[-1].id}"],
-                           check=False, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-        except OSError:
-            pass
-        print(f"\n  {C['gry']}它们就在你当前这个 tmux 会话里。"
-              f"切窗口：{C['cyn']}Ctrl-B 数字/n/p{C['r']}"
-              f"{C['gry']}，列表：{C['cyn']}Ctrl-B w{C['r']}\n")
+        print(f"\n  {C['gry']}就在你当前这个 tmux 会话里。"
+              f"切格子：{C['cyn']}Ctrl-B 方向键{C['r']}"
+              f"{C['gry']}　放大：{C['cyn']}Ctrl-B z{C['r']}"
+              f"{C['gry']}（再按一次还原）{C['r']}\n")
     else:
         print(f"\n  {C['gry']}正在进入 tmux 会话 {C['cyn']}{sess}{C['r']}"
               f"{C['gry']}——它们会一直在后台活着{C['r']}")
-        print(f"  {C['gry']}切窗口 {C['cyn']}Ctrl-B 数字/n/p{C['r']}"
+        print(f"  {C['gry']}切格子 {C['cyn']}Ctrl-B 方向键{C['r']}"
+              f"{C['gry']}　放大一格 {C['cyn']}Ctrl-B z{C['r']}"
               f"{C['gry']}　脱离 {C['cyn']}Ctrl-B d{C['r']}"
               f"{C['gry']}　回来 {C['cyn']}ag attach{C['r']}\n")
         sys.stdout.flush()
@@ -648,20 +755,51 @@ def launch_many(entries, layout="windows", resume=False, session=None):
 
 
 def cmd_team(entries, args):
-    """一次开多个 agent，各占一个窗口。
+    """一次开多个 agent。
 
-        ag team                  打开多选器（Tab 勾选）
-        ag team cc oc goose      直接指定几个
-        ag team --panes cc oc    用分屏而不是分窗口
+        ag team                  多选器（Tab 勾选），默认切宫格
+        ag team cc oc goose      直接点名
+        ag team --grid 3x3 ...   指定几列几行
+        ag team --cols 3 ...     只指定列数，行数自己算
+        ag team --windows ...    不开宫格，一人一个 tmux 窗口
         ag team -r cc oc         都续聊上次的会话
     """
-    layout = "panes" if "--panes" in args else "windows"
+    # --panes 是老的写法，现在宫格就是默认，留着免得旧习惯敲了报错
+    layout = "windows" if ("--windows" in args or "-w" in args) else "grid"
     resume = "-r" in args or "--resume" in args
     session = None
-    for a in args:
+    grid = None
+    cols = None
+    for i, a in enumerate(args):
         if a.startswith("--session="):
             session = a.split("=", 1)[1]
-    ids = [a for a in args if not a.startswith("-")]
+        elif a in ("-s", "--session") and i + 1 < len(args):
+            session = args[i + 1]
+        elif a.startswith("--grid="):
+            grid = parse_grid(a.split("=", 1)[1])
+        elif a == "--grid" and i + 1 < len(args):
+            grid = parse_grid(args[i + 1])
+        elif a.startswith("--cols="):
+            try:
+                cols = int(a.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif a == "--cols" and i + 1 < len(args):
+            try:
+                cols = int(args[i + 1])
+            except ValueError:
+                pass
+
+    def is_val(x, key):
+        """这个 token 是不是某个选项的值，别被当成 agent 名。"""
+        return x in (grid_spec, cols_spec, session)
+
+    grid_spec = next((args[j + 1] for j, x in enumerate(args)
+                      if x == "--grid" and j + 1 < len(args)), None)
+    cols_spec = next((args[j + 1] for j, x in enumerate(args)
+                      if x == "--cols" and j + 1 < len(args)), None)
+    ids = [a for a in args
+           if not a.startswith("-") and a not in (session, grid_spec, cols_spec)]
 
     if ids:
         picked = []
@@ -678,17 +816,30 @@ def cmd_team(entries, args):
             print(f"  {C['gry']}没选，退出{C['r']}")
             return 0
 
+    if cols and not grid:
+        grid = (cols, -(-len(picked) // cols))
+
     if "--dry-run" in args or "-n" in args:
         sess = session or "ag"
-        print(f"\n  {C['b']}将开 {len(picked)} 个 tmux "
-              f"{'分屏' if layout == 'panes' else '窗口'}{C['r']}"
+        plan = build_tmux_plan(picked, sess, layout, resume, fresh=True, grid=grid)
+        shape = ("一人一个窗口" if layout == "windows"
+                 else "{}×{} 宫格".format(*(grid or auto_grid(len(picked)))))
+        print(f"\n  {C['b']}将开 {len(picked)} 个 tmux {shape}{C['r']}"
               f"  {C['gry']}(--dry-run，没真跑){C['r']}\n")
-        for argv, e in build_tmux_plan(picked, sess, layout, resume, fresh=True):
+        cols_ = (grid or auto_grid(len(picked)))[0] if layout != "windows" else 1
+        n = 0
+        for argv, e, target in plan:
             if e is None:
                 print(f"    {C['gry']}{shlex.join(argv)}{C['r']}")
             else:
-                print(f"    {C['b']}{pad(e.id, 12)}{C['r']} "
+                if layout == "windows":
+                    where = f"窗口 {n + 1}"
+                else:
+                    where = f"第 {n // cols_ + 1} 行第 {n % cols_ + 1} 列"
+                print(f"    {C['gry']}{pad(where, 18)}{C['r']}"
+                      f"{C['b']}{pad(e.id, 12)}{C['r']} "
                       f"{C['cyn']}{argv[-1]}{C['r']}")
+                n += 1
         print()
         return 0
 
@@ -698,7 +849,8 @@ def cmd_team(entries, args):
 
     if len(picked) == 1 and not ids:
         return cmd_launch(picked[0], [], resume=resume)
-    return launch_many(picked, layout=layout, resume=resume, session=session)
+    return launch_many(picked, layout=layout, resume=resume,
+                       session=session, grid=grid)
 
 
 def cmd_attach(entries, args):
@@ -2544,7 +2696,8 @@ def usage():
   {C['b']}一次开多个（tmux 窗口/分屏）{C['r']}
     ag team               打开多选器，勾几个就开几个
     ag team cc oc goose   直接指定几个
-    ag team --panes cc oc 用分屏（同屏都能看见）
+    ag team --grid 3x2 cc oc goose  指定几列几行
+    ag team --windows cc oc         不开宫格，一人一个窗口
     ag team -r cc oc      都续聊上次的会话
     ag attach             回到之前的 tmux 会话
     ag ps                 看现在有哪些 agent 在跑

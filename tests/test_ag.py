@@ -711,6 +711,10 @@ say("  · build_tmux_plan")
 reg_t = ag.load_registry()
 three = [ag.find_entry(reg_t, i) for i in ("cc", "oc", "goose")]
 plan = ag.build_tmux_plan(three, "ag", "windows", resume=False, fresh=True)
+check("默认布局是宫格（不是窗口）",
+      ag.build_tmux_plan(three, "ag")[0][0][1] == "new-session" and
+      ag.build_tmux_plan(three, "ag")[1][0][1] == "split-window",
+      str([p[0][1] for p in ag.build_tmux_plan(three, "ag")]))
 check("窗口模式：第一个 new-session，其余 new-window",
       plan[0][0][1] == "new-session" and plan[1][0][1] == "new-window"
       and plan[2][0][1] == "new-window", str([p[0][1] for p in plan]))
@@ -719,13 +723,16 @@ check("每条都带 -c 工作目录", all("-c" in p[0] for p in plan))
 check("命令是整条一个参数（过 shell，带空格也不散）",
       plan[0][0][-1] == "claude", plan[0][0][-1])
 
-plan2 = ag.build_tmux_plan(three, "ag", "panes", resume=False, fresh=True)
-check("分屏模式：用 split-window",
+plan2 = ag.build_tmux_plan(three, "ag", "grid", resume=False, fresh=True)
+check("宫格：用 split-window",
       plan2[1][0][1] == "split-window" and plan2[2][0][1] == "split-window",
       str([p[0][1] for p in plan2]))
-check("分屏最后会 tiled 排一下",
-      plan2[-1][0][1:3] == ["select-layout", "-t"] and "tiled" in plan2[-1][0],
-      str(plan2[-1][0]))
+check("宫格最后会 tiled 排一下",
+      any(p[0][1:3] == ["select-layout", "-t"] and "tiled" in p[0] for p in plan2),
+      str([p[0][1:3] for p in plan2]))
+check("--panes 是 grid 的老写法，行为一致",
+      [p[0][1] for p in ag.build_tmux_plan(three, "ag", "panes")] ==
+      [p[0][1] for p in plan2])
 
 plan3 = ag.build_tmux_plan([ag.find_entry(reg_t, "cc")], "ag",
                            "windows", resume=True, fresh=False)
@@ -743,8 +750,10 @@ rc, o = runcmd(["team", "--dry-run", "cc", "oc"])
 check("--dry-run 不真跑", rc == 0 and "没真跑" in o, o[:160])
 check("dry-run 里能看到两个短名", "cc" in o and "oc" in o)
 check("dry-run 里能看到真命令", "claude" in o and "opencode" in o)
-rc, o = runcmd(["team", "--dry-run", "--panes", "cc", "oc"])
-check("--panes 反映到输出", "分屏" in o, o[:100])
+rc, o = runcmd(["team", "--dry-run", "cc", "oc"])
+check("默认就是宫格", "宫格" in o, o[:100])
+rc, o = runcmd(["team", "--dry-run", "--plan" if False else "--windows", "cc", "oc"])
+check("--windows 走老路", "窗口" in o and "宫格" not in o, o[:120])
 rc, o = runcmd(["team", "nosuch"])
 check("不存在的 id 报错", rc != 0)
 
@@ -1034,6 +1043,93 @@ check("示例注册表每条都有 group", all(e.group for e in reg_g),
       str([e.id for e in reg_g if not e.group]))
 check("分组数在合理范围（2~8 组）", 2 <= len(groups_seen) <= 8, str(len(groups_seen)))
 check("没有空组", all(v for v in groups_seen.values()))
+
+say()
+say("20) 宫格布局")
+say("  · auto_grid 的形状")
+for n, want in [(1, (1, 1)), (2, (2, 1)), (3, (3, 1)), (4, (2, 2)),
+                (5, (3, 2)), (6, (3, 2)), (7, (4, 2)), (8, (4, 2)),
+                (9, (3, 3)), (12, (4, 3)), (16, (4, 4))]:
+    got_g = ag.auto_grid(n)
+    check(f"{n} 个 → {want[0]}×{want[1]}", got_g == want, str(got_g))
+bad_tall = [n for n in range(1, 25) if ag.auto_grid(n)[1] > ag.auto_grid(n)[0]]
+check("永远不给「竖着比横着长」的形状", not bad_tall, str(bad_tall))
+check("格子数永远够（不会装不下）",
+      all(ag.auto_grid(n)[0] * ag.auto_grid(n)[1] >= n for n in range(1, 40)))
+check("2 个是左右并排（不是上下叠）", ag.auto_grid(2) == (2, 1))
+check("--cols 能强制列数", ag.auto_grid(7, cols=7) == (7, 1), str(ag.auto_grid(7, cols=7)))
+
+say("  · parse_grid")
+for spec, want in [("3x2", (3, 2)), ("3X2", (3, 2)), ("2*2", (2, 2)),
+                   ("2×2", (2, 2)), (" 3 x 2 ", (3, 2)),
+                   ("3x", None), ("x2", None), ("0x2", None), ("abc", None)]:
+    check(f"{spec!r} → {want}", ag.parse_grid(spec) == want, str(ag.parse_grid(spec)))
+
+say("  · 宫格的 tmux 命令")
+reg_g2 = ag.load_registry()
+four = [ag.find_entry(reg_g2, i) for i in ("cc", "oc", "goose", "codex")]
+pl = ag.build_tmux_plan(four, "ag", "grid", grid=(2, 2))
+kinds = [p[0][1] for p in pl if p[1] is not None]
+check("第一格 new-session，其余 split-window", kinds[0] == "new-session"
+      and all(k == "split-window" for k in kinds[1:]), str(kinds))
+check("2×2 里是 1 次横切 + 2 次竖切",
+      sum(1 for p in pl if "-h" in p[0]) == 1 and
+      sum(1 for p in pl if "-v" in p[0]) == 2,
+      str([p[0] for p in pl]))
+check("每个 pane 都用 -P -F 把 id 打回来",
+      all("-P" in p[0] and "#{pane_id}" in p[0] for p in pl if p[1] is not None))
+targets = [p[2] for p in pl if p[1] is not None]
+check("分割目标指向「前面捕获到的 pane」（@k 形式）",
+      targets[0] is None and all(t.startswith("@") for t in targets[1:]),
+      str(targets))
+check("先 tiled 排一下再设边框",
+      [p[0][1] for p in pl if p[1] is None].count("select-layout") == 1 and
+      any("pane-border-status" in p[0] for p in pl))
+check("3×2 会切成 2 横 + 3 竖",
+      sum(1 for p in ag.build_tmux_plan(
+          four + [ag.find_entry(reg_g2, "kimi"), ag.find_entry(reg_g2, "gemini")],
+          "ag", "grid", grid=(3, 2)) if "-h" in p[0]) == 2)
+
+pl_w = ag.build_tmux_plan(four, "ag", "windows")
+check("--windows 仍然是 new-window 那套",
+      pl_w[0][0][1] == "new-session" and pl_w[1][0][1] == "new-window",
+      str([p[0][1] for p in pl_w]))
+check("窗口模式不带 -P", all("-P" not in p[0] for p in pl_w))
+
+say("  · 格子太小要提醒")
+saved_sh, saved_sub = ag.shutil, ag.subprocess
+class OkProc:
+    DEVNULL = -3
+    class SubprocessError(Exception): pass
+    calls = []
+    @classmethod
+    def run(cls, argv, **kw):
+        cls.calls.append(list(argv))
+        return types.SimpleNamespace(returncode=0, stdout="%9", stderr="")
+ag.shutil = types.SimpleNamespace(
+    which=lambda c: "/usr/local/bin/tmux",
+    get_terminal_size=lambda d=(100, 30): os.terminal_size((80, 24)))
+ag.subprocess = OkProc
+ag.launch_many = _real_launch_many
+# 假装在 tmux 里 —— 否则真实分支会去 os.execvp 真 tmux
+saved_tmux2 = os.environ.get("TMUX")
+os.environ["TMUX"] = "/tmp/fake,1,0"
+try:
+    buf = io.StringIO()
+    saved_out = ag.sys.stdout
+    ag.sys.stdout = buf
+    try:
+        ag.launch_many(four, layout="grid", session="zz")
+    finally:
+        ag.sys.stdout = saved_out
+    check("小终端里会提醒格子挤", "可能挤" in buf.getvalue(), buf.getvalue()[:200])
+    check("提醒里给了 --windows 的出路", "--windows" in buf.getvalue())
+finally:
+    ag.shutil, ag.subprocess = saved_sh, saved_sub
+    if saved_tmux2 is None:
+        os.environ.pop("TMUX", None)
+    else:
+        os.environ["TMUX"] = saved_tmux2
 
 say()
 say("=" * 64)
