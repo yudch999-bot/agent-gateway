@@ -1,0 +1,46 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 语法检查
+        run: python -m py_compile ag tests/test_ag.py
+
+      - name: 回归测试
+        run: python tests/test_ag.py
+
+      - name: 冒烟测试（无 tty 时 ls 应正常输出）
+        run: |
+          AG_REGISTRY=./registry.example.toml python ag ls | head -20
+          AG_REGISTRY=./registry.example.toml python ag ls --json | python -c "import json,sys; d=json.load(sys.stdin); assert len(d) > 0; print(f'{len(d)} 条')"
+          AG_REGISTRY=./registry.example.toml python ag which cc
+          AG_REGISTRY=./registry.example.toml python ag doctor | tail -3
+          AG_REGISTRY=./registry.example.toml python ag path
+
+      - name: 低版本 Python 应给出友好提示而不是 traceback
+        run: |
+          if python -c "import sys; sys.exit(0 if sys.version_info < (3,11) else 1)"; then
+            out=$(python ag ls 2>&1 || true)
+            echo "$out"
+            echo "$out" | grep -q "需要 Python 3.11" || { echo "没有给出友好提示"; exit 1; }
+          else
+            echo "当前是 3.11+，跳过"
+          fi

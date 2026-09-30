@@ -1,0 +1,311 @@
+# ============================================================
+#  ag — Agent Gateway 注册表
+#  统一管理本机所有 AI coding agent 的启动方式
+# ============================================================
+#  这个文件就是全部配置。加一个 agent = 加一个 [[agent]] 块，保存即生效。
+#
+#  两种加法：
+#    1) 命令行向导：  ag add
+#    2) 直接在这里加一个 [[agent]] 块
+#
+#  字段说明：
+#    id       必填，唯一短名，就是 `ag <id>` 敲的那个
+#    name     显示名
+#    cmd      必填，可执行文件（名字或绝对路径）
+#    args     固定参数（启动时永远带上）
+#    desc     一句话说明，选择器里显示
+#    tags     标签，方便搜索（空格分隔的数组）
+#    env      额外环境变量，形如 { KEY = "VALUE" }
+#    cwd      启动目录，支持 ~
+#    alias    额外别名，`ag <alias>` 也能启动
+#    install  安装命令，`ag install <id>` 会执行它
+#    hidden   true 则不在选择器里显示（仍可 ag <id> 直接启动）
+#
+#  不想要某条？  ag rm <id>      （只删那一块，注释会保留）
+#  想改？        ag edit
+# ============================================================
+
+# ---------- 1. DeepSeek Harness ----------
+[[agent]]
+id = "d"
+name = "DeepSeek Harness"
+cmd = "dsh-tui"
+desc = "DeepSeek 官方 harness TUI"
+tags = ["deepseek", "official"]
+alias = ["dsh"]
+install = "npm i -g @deepseek-ai/dsh"
+
+[[agent]]
+id = "dsh-web"
+name = "DeepSeek Harness (Web)"
+cmd = "dsh"
+args = ["web"]
+desc = "DeepSeek harness 网页模式"
+tags = ["deepseek", "official", "web"]
+
+# ---------- 2. Claude Code ----------
+[[agent]]
+id = "cc"
+name = "Claude Code"
+cmd = "claude"
+desc = "Anthropic 官方 CLI"
+tags = ["anthropic", "official"]
+alias = ["claude"]
+install = "curl -fsSL https://claude.ai/install.sh | bash"
+
+# ---------- 3. Codex ----------
+[[agent]]
+id = "codex"
+name = "Codex CLI"
+cmd = "codex"
+desc = "OpenAI 官方 CLI"
+tags = ["openai", "official"]
+install = "npm i -g @openai/codex@latest"
+
+# ---------- 4. Gemini CLI ----------
+[[agent]]
+id = "gemini"
+name = "Gemini CLI"
+cmd = "gemini"
+desc = "Google 官方 CLI"
+tags = ["google", "official"]
+install = "npm i -g @google/gemini-cli@latest"
+
+# ---------- 5. Grok Build ----------
+[[agent]]
+id = "grok"
+name = "Grok Build"
+cmd = "grok"
+desc = "xAI Grok 编码 TUI"
+tags = ["xai", "grok"]
+install = "npm i -g @xai-official/grok@latest"
+
+# ---------- 6. OpenCode ----------
+[[agent]]
+id = "oc"
+name = "OpenCode"
+cmd = "opencode"
+desc = "开源终端编码 agent"
+tags = ["opensource", "tui"]
+alias = ["opencode"]
+install = "curl -fsSL https://opencode.ai/install | bash"
+
+# ---------- 7. OpenClaw（主会话 + 8 个专职 session）----------
+# 这一段同时演示了 args 的用法：同一个 openclaw 二进制，靠不同的
+# --session 参数分出 9 个互不干扰的入口。你自己的多会话工具也这么写。
+[[agent]]
+id = "ot"
+name = "OpenClaw · main 总编辑"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:main:main"]
+desc = "主 agent / 总编辑"
+tags = ["openclaw", "team"]
+alias = ["openclaw"]
+install = "npm i -g openclaw@latest"
+
+[[agent]]
+id = "ot-ceo"
+name = "OpenClaw · ceo 内容策划"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:ceo:main"]
+desc = "内容策划"
+tags = ["openclaw", "team"]
+
+[[agent]]
+id = "ot-product"
+name = "OpenClaw · product 深度研究员"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:product:main"]
+desc = "深度研究员"
+tags = ["openclaw", "team"]
+
+[[agent]]
+id = "ot-dev"
+name = "OpenClaw · development 文案写手"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:development:main"]
+desc = "文案写手"
+tags = ["openclaw", "team"]
+
+[[agent]]
+id = "ot-design"
+name = "OpenClaw · design 视觉设计师"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:design:main"]
+desc = "视觉设计师"
+tags = ["openclaw", "team"]
+
+[[agent]]
+id = "ot-marketing"
+name = "OpenClaw · marketing 平台优化师"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:marketing:main"]
+desc = "平台优化师"
+tags = ["openclaw", "team"]
+
+[[agent]]
+id = "ot-data"
+name = "OpenClaw · data 数据分析师"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:data:main"]
+desc = "数据分析师"
+tags = ["openclaw", "team"]
+
+[[agent]]
+id = "ot-ops"
+name = "OpenClaw · operations 发布运营"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:operations:main"]
+desc = "发布运营"
+tags = ["openclaw", "team"]
+
+[[agent]]
+id = "ot-finance"
+name = "OpenClaw · finance 社群运营"
+cmd = "openclaw"
+args = ["tui", "--session", "agent:finance:main"]
+desc = "社群运营"
+tags = ["openclaw", "team"]
+
+# ---------- 8. Hermes Agent ----------
+[[agent]]
+id = "h"
+name = "Hermes Agent"
+cmd = "hermes"
+desc = "NousResearch Hermes agent"
+tags = ["hermes"]
+alias = ["hermes"]
+install = "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
+
+[[agent]]
+id = "ht"
+name = "Hermes TUI"
+cmd = "hermes"
+args = ["--tui"]
+desc = "Hermes 终端界面"
+tags = ["hermes", "tui"]
+
+[[agent]]
+id = "hwu"
+name = "Hermes Web UI"
+cmd = "hermes-web-ui"
+args = ["start"]
+desc = "Hermes 网页界面"
+tags = ["hermes", "web"]
+
+[[agent]]
+id = "hpw"
+name = "Hermes · wechat profile"
+cmd = "hermes"
+args = ["--profile", "wechat"]
+desc = "公众号写作 profile"
+tags = ["hermes", "profile"]
+
+[[agent]]
+id = "hpt"
+name = "Hermes · toutiao profile"
+cmd = "hermes"
+args = ["--profile", "toutiao"]
+desc = "头条运营 profile"
+tags = ["hermes", "profile"]
+
+[[agent]]
+id = "hpc"
+name = "Hermes · coder profile"
+cmd = "hermes"
+args = ["--profile", "coder"]
+desc = "写代码 profile"
+tags = ["hermes", "profile"]
+
+# ---------- 9. Pi ----------
+[[agent]]
+id = "pi"
+name = "Pi"
+cmd = "pi"
+desc = "@earendil-works/pi-coding-agent"
+tags = ["pi"]
+install = "npm i -g @earendil-works/pi-coding-agent@latest"
+
+# ---------- 10. Oh My Pi ----------
+[[agent]]
+id = "omp"
+name = "Oh My Pi"
+cmd = "omp"
+desc = "Pi 的增强版"
+tags = ["pi", "omp"]
+install = "curl -fsSL https://omp.sh/install | sh"
+
+# ---------- 11. Prime Agent ----------
+[[agent]]
+id = "pa"
+name = "Prime Agent"
+cmd = "prime-agent"
+desc = "PrimeIntellect agent"
+tags = ["prime"]
+alias = ["prime-agent"]
+install = "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
+
+# ---------- 12. JCode ----------
+[[agent]]
+id = "j"
+name = "JCode"
+cmd = "jcode"
+desc = "jcode.sh"
+tags = ["jcode"]
+alias = ["jcode"]
+install = "curl -fsSL https://jcode.sh/install | bash"
+
+# ---------- 13. Kimi Code ----------
+[[agent]]
+id = "kimi"
+name = "Kimi Code"
+cmd = "kimi"
+desc = "Moonshot Kimi 编码 CLI"
+tags = ["moonshot", "kimi"]
+install = "curl -LsSf https://code.kimi.com/install.sh | bash"
+
+# ---------- 14. Goose ----------
+[[agent]]
+id = "goose"
+name = "Goose"
+cmd = "goose"
+desc = "Block/aaif 开源 agent"
+tags = ["goose", "opensource"]
+install = "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash"
+
+# ---------- 15. Oh My Codex ----------
+[[agent]]
+id = "omx"
+name = "Oh My Codex"
+cmd = "omx"
+desc = "Codex 增强封装"
+tags = ["codex", "wrapper"]
+install = "npm install -g oh-my-codex"
+
+# ---------- 16. Oh My ClaudeCode ----------
+[[agent]]
+id = "omc"
+name = "Oh My ClaudeCode"
+cmd = "omc"
+desc = "Claude Code 增强封装 (sisyphus)"
+tags = ["claude", "wrapper"]
+install = "npm i -g oh-my-claude-sisyphus@latest"
+
+# ---------- 17. MiniMax Code ----------
+[[agent]]
+id = "mcode"
+name = "MiniMax Code"
+cmd = "mcode"
+desc = "MiniMax 编码 CLI"
+tags = ["minimax"]
+install = "curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash"
+
+# ---------- 18. CodeWhale ----------
+[[agent]]
+id = "cw"
+name = "CodeWhale"
+cmd = "codewhale"
+desc = "codewhale.net"
+tags = ["codewhale"]
+alias = ["codewhale"]
+install = "curl -fsSL https://codewhale.net/install.sh | sh"

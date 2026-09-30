@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ag — Agent Gateway
+把本机所有 AI coding agent 收进一个命令里，随意切换、自由扩展。
+
+    ag                  模糊选择器，选中回车即启动
+    ag cc               直接启动 Claude Code
+    ag cc --resume      透传参数给它
+    ag ls               列出全部（含安装状态）
+    ag add              向导式添加新 agent
+    ag scan             扫描 PATH，发现没登记的 agent
+    ag doctor           体检
+    ag edit             手改注册表
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+# 先把 Python 版本这关过了，再 import 别的，免得甩一脸 traceback
+if sys.version_info < (3, 11):
+    sys.exit(
+        f"\033[31m✗\033[0m ag 需要 Python 3.11+（用到标准库 tomllib），"
+        f"当前是 {sys.version.split()[0]}\n"
+        f"  用的是： {sys.executable}\n"
+        f"  macOS 自带的 /usr/bin/python3 通常是 3.9，太老。装一个新的：\n"
+        f"      brew install python@3.12     或     pyenv install 3.12\n"
+        f"  装好确认 `python3 --version` 是 3.11+ 再跑 ag。"
+    )
+
+import shutil
+import subprocess
+import select
+import termios
+import tty
+import textwrap
+import tomllib
+
+# ---------------------------------------------------------------- 常量
+
+HOME = os.path.expanduser("~")
+AG_DIR = os.path.join(HOME, ".agents")
+# 想用别的注册表（比如给项目单独配一份）： export AG_REGISTRY=/path/to/x.toml
+REGISTRY = os.path.expanduser(os.environ.get("AG_REGISTRY")
+                              or os.path.join(AG_DIR, "registry.toml"))
+VERSION = "1.0.0"
+
+if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+    C = dict(r="\033[0m", b="\033[1m", dim="\033[2m",
+             red="\033[31m", grn="\033[32m", yel="\033[33m",
+             blu="\033[34m", mag="\033[35m", cyn="\033[36m",
+             gry="\033[90m", inv="\033[7m")
+else:
+    C = {k: "" for k in "r b dim red grn yel blu mag cyn gry inv".split()}
+
+
+# ---------------------------------------------------------------- 数据模型
+
+class Entry:
+    __slots__ = ("id", "name", "cmd", "args", "desc", "tags",
+                 "alias", "env", "cwd", "install", "hidden", "raw")
+
+    def __init__(self, d: dict):
+        self.raw = d
+        self.id = str(d.get("id", "")).strip()
+        self.name = str(d.get("name", self.id)).strip()
+        self.cmd = str(d.get("cmd", "")).strip()
+        self.args = [str(a) for a in d.get("args", [])]
+        self.desc = str(d.get("desc", "")).strip()
+        self.tags = [str(t) for t in d.get("tags", [])]
+        self.alias = [str(a) for a in d.get("alias", [])]
+        self.env = {str(k): str(v) for k, v in d.get("env", {}).items()}
+        self.cwd = str(d.get("cwd", "")).strip()
+        self.install = str(d.get("install", "")).strip()
+        self.hidden = bool(d.get("hidden", False))
+
+    @property
+    def all_ids(self):
+        return [self.id] + self.alias
+
+    def haystack(self) -> str:
+        return " ".join([self.id, self.name, self.desc, self.cmd,
+                         " ".join(self.tags), " ".join(self.alias)]).lower()
+
+    def resolved(self):
+        """返回可执行文件绝对路径，找不到返回 None。"""
+        if not self.cmd:
+            return None
+        if "/" in self.cmd:
+            p = os.path.expanduser(self.cmd)
+            return p if os.access(p, os.X_OK) else None
+        return shutil.which(self.cmd)
+
+    def argv(self, extra=None):
+        return [self.cmd, *self.args, *(extra or [])]
+
+
+def load_registry(path=REGISTRY):
+    if not os.path.exists(path):
+        return []
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    out = []
+    for d in data.get("agent", []):
+        e = Entry(d)
+        if e.id and e.cmd:
+            out.append(e)
+    return out
+
+
+def find_entry(entries, key):
+    """精确匹配 id 或 alias。"""
+    k = key.lower()
+    for e in entries:
+        if any(a.lower() == k for a in e.all_ids):
+            return e
+    return None
+
+
+def fuzzy(entries, query):
+    """返回 (entry, rank) 列表，按 rank 排序。空 query 返回全部。
+
+    rank: 0 精确 id · 1 id 前缀 · 2 id 含 · 3 名字前缀 · 4 别名前缀
+          5 主字段含 · 6 只在说明/标签里命中（沉底，但仍可搜到）
+    """
+    q = query.strip().lower()
+    if not q:
+        return [(e, 0) for e in entries]
+    tokens = q.split()
+    hits = []
+    for e in entries:
+        hay = e.haystack()
+        if not all(t in hay for t in tokens):
+            continue
+        primary = " ".join([e.id, e.name, *e.alias]).lower()
+        i = e.id.lower()
+        if i == q:
+            rank = 0
+        elif i.startswith(q):
+            rank = 1
+        elif q in i:
+            rank = 2
+        elif e.name.lower().startswith(q):
+            rank = 3
+        elif any(a.lower().startswith(q) for a in e.all_ids):
+            rank = 4
+        elif all(t in primary for t in tokens):
+            rank = 5
+        else:
+            rank = 6
+        hits.append((e, rank))
+    hits.sort(key=lambda t: (t[1], len(t[0].id), t[0].id))
+    return hits
+
+
+# ---------------------------------------------------------------- 工具
+
+def term_width(default=100):
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+
+def vis_len(s):
+    """粗略可见宽度（中文算 2）。"""
+    import unicodedata
+    n = 0
+    for ch in s:
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+
+def pad(s, width):
+    n = vis_len(s)
+    return s + " " * max(0, width - n)
+
+
+def trunc(s, width):
+    if vis_len(s) <= width:
+        return s
+    out, n = "", 0
+    for ch in s:
+        w = 2 if ord(ch) > 0x2E80 else 1
+        if n + w > width - 1:
+            return out + "…"
+        out += ch
+        n += w
+    return out
+
+
+def die(msg, code=1):
+    print(f"{C['red']}✗{C['r']} {msg}", file=sys.stderr)
+    return code
+
+
+# ---------------------------------------------------------------- 启动
+
+def cmd_launch(e: Entry, extra):
+    path = e.resolved()
+    if not path:
+        print(f"{C['red']}✗ 找不到可执行文件 「{e.cmd}」{C['r']}")
+        if e.install:
+            print(f"  装一下：  {C['cyn']}{e.install}{C['r']}")
+        else:
+            print(f"  用 {C['cyn']}ag edit{C['r']} 检查 registry.toml 里的 cmd 字段")
+        return 127
+
+    if e.cwd:
+        target = os.path.expanduser(e.cwd)
+        if os.path.isdir(target):
+            os.chdir(target)
+        else:
+            print(f"{C['yel']}! 工作目录不存在，保持当前目录：{target}{C['r']}")
+
+    env = os.environ.copy()
+    env.update(e.env)
+    argv = e.argv(extra)
+
+    print(f"{C['grn']}▶{C['r']} {C['b']}{e.name}{C['r']} "
+          f"{C['gry']}({e.id}){C['r']}  {C['dim']}{' '.join(argv)}{C['r']}")
+    sys.stdout.flush()
+
+    try:
+        os.execvpe(e.cmd, argv, env)
+    except FileNotFoundError:
+        return die(f"启动失败：{e.cmd} 不在 PATH 上")
+    except PermissionError:
+        return die(f"启动失败：{path} 没有执行权限")
+    except OSError as ex:
+        return die(f"启动失败：{ex}")
+
+
+# ---------------------------------------------------------------- 模糊选择器
+
+def picker(entries, initial="", prompt="选一个 agent"):
+    """全屏模糊选择器。返回选中的 Entry，取消返回 None。"""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+
+    def restore():
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?1049l")   # 退出备用屏幕
+        sys.stdout.write("\033[?25h")     # 显示光标
+        sys.stdout.flush()
+
+    def read_key():
+        b = os.read(fd, 1)
+        if not b:
+            return "EOF"
+        if b == b"\x1b":
+            r, _, _ = select.select([fd], [], [], 0.03)
+            if not r:
+                return "ESC"
+            seq = os.read(fd, 1)
+            if seq in (b"[", b"O"):
+                while True:
+                    r, _, _ = select.select([fd], [], [], 0.03)
+                    if not r:
+                        break
+                    c = os.read(fd, 1)
+                    if not c:          # 终端没了，别转圈
+                        return "EOF"
+                    seq += c
+                    if c.isalpha() or c == b"~":
+                        break
+                return {b"[A": "UP", b"[B": "DOWN", b"[H": "HOME",
+                        b"[F": "END", b"[5~": "PGUP", b"[6~": "PGDN"}.get(seq, "UNK")
+            return "ESC"
+        if b in (b"\r", b"\n"):
+            return "ENTER"
+        if b in (b"\x7f", b"\x08"):
+            return "BACKSPACE"
+        if b == b"\x03":
+            return "ESC"
+        if b == b"\x15":
+            return "CLEAR"
+        if b == b"\x10":
+            return "UP"
+        if b == b"\x0e":
+            return "DOWN"
+        # UTF-8 多字节
+        if b[0] >= 0x80:
+            need = 2 if b[0] >> 5 == 0b110 else 3 if b[0] >> 4 == 0b1110 else 4
+            buf = b
+            while len(buf) < need:
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if not r:
+                    break
+                buf += os.read(fd, 1)
+            return buf.decode("utf-8", "ignore")
+        return b.decode("utf-8", "ignore")
+
+    query = initial
+    cursor = 0
+    visible = [e for e in entries if not e.hidden]
+    W = term_width()
+
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\033[?1049h\033[?25l")  # 备用屏幕 + 隐藏光标
+        sys.stdout.flush()
+
+        while True:
+            hits = fuzzy(visible, query)
+            items = [e for e, _ in hits]
+            if cursor >= len(items):
+                cursor = max(0, len(items) - 1)
+
+            W = term_width()
+            H = shutil.get_terminal_size((100, 24)).lines
+            list_h = max(5, H - 6)
+            top = max(0, min(cursor - list_h // 2, len(items) - list_h))
+
+            idw = max([vis_len(e.id) for e in visible] + [2])
+            namew = min(34, max([vis_len(e.name) for e in visible] + [4]))
+
+            out = ["\033[H\033[2J"]
+            out.append(f"  {C['b']}{C['mag']}ag{C['r']} {C['dim']}Agent Gateway{C['r']}"
+                       f"  {C['gry']}{len(items)}/{len(visible)} · {prompt} · 输入即筛选{C['r']}\r\n")
+            out.append(f"  {C['cyn']}❯{C['r']} {C['b']}{query}{C['r']}\033[?25h\033[?25l\r\n")
+            out.append(f"  {C['gry']}{'─' * min(W - 4, 96)}{C['r']}\r\n")
+
+            if not items:
+                out.append(f"\r\n  {C['yel']}没有匹配的 agent{C['r']}\r\n")
+
+            for i in range(top, min(top + list_h, len(items))):
+                e = items[i]
+                ok = e.resolved() is not None
+                idc = pad(e.id, idw)
+                nmc = pad(trunc(e.name, namew), namew)
+                dsc = trunc(e.desc, max(10, W - idw - namew - 14))
+                # 选中行与非选中行前缀完全一致，只靠反显区分，避免左右跳动
+                dot = "●" if ok else "○"
+                dotc = C['grn'] if ok else C['red']
+                if i == cursor:
+                    line = (f"{C['inv']}  {dotc}{dot}{C['r']}"
+                            f"{C['inv']} {C['b']}{idc}{C['r']}"
+                            f"{C['inv']}  {nmc}  {C['gry']}{dsc}{C['r']}{C['inv']} {C['r']}")
+                else:
+                    line = (f"  {dotc}{dot}{C['r']} {C['b']}{idc}{C['r']}"
+                            f"  {nmc}  {C['gry']}{dsc}{C['r']}")
+                out.append(line + "\r\n")
+
+            out.append(f"  {C['gry']}{'─' * min(W - 4, 96)}{C['r']}\r\n")
+
+            # 详情行
+            if items:
+                e = items[cursor]
+                bits = [f"{C['cyn']}{' '.join(e.argv())}{C['r']}"]
+                if e.tags:
+                    bits.append(f"{C['gry']}tags: {','.join(e.tags)}{C['r']}")
+                if e.cwd:
+                    bits.append(f"{C['gry']}cwd: {e.cwd}{C['r']}")
+                if not e.resolved() and e.install:
+                    bits.append(f"{C['red']}未安装{C['r']}")
+                out.append("  " + "  ".join(bits) + "\r\n")
+            else:
+                out.append("\r\n")
+
+            out.append(f"  {C['gry']}↑↓/Ctrl-P,N 移动 · Enter 启动 · Esc 退出 · "
+                       f"Ctrl-U 清空{C['r']}\r\n")
+
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+
+            k = read_key()
+            if k in ("ESC", "EOF"):
+                return None
+            if k == "ENTER":
+                return items[cursor] if items else None
+            if k == "UP":
+                cursor = max(0, cursor - 1)
+            elif k == "DOWN":
+                cursor = min(len(items) - 1, cursor + 1)
+            elif k == "PGUP":
+                cursor = max(0, cursor - list_h)
+            elif k == "PGDN":
+                cursor = min(max(0, len(items) - 1), cursor + list_h)
+            elif k == "HOME":
+                cursor = 0
+            elif k == "END":
+                cursor = max(0, len(items) - 1)
+            elif k == "BACKSPACE":
+                query = query[:-1]
+                cursor = 0
+            elif k == "CLEAR":
+                query = ""
+                cursor = 0
+            elif len(k) == 1 or (k and k not in ("UNK",)):
+                query += k
+                cursor = 0
+    finally:
+        restore()
+
+
+# ---------------------------------------------------------------- 子命令
+
+def cmd_ls(entries, args):
+    as_json = "--json" in args
+    show_all = "--all" in args or "-a" in args
+    rows = [e for e in entries if show_all or not e.hidden]
+
+    if as_json:
+        import json
+        print(json.dumps([{
+            "id": e.id, "name": e.name, "cmd": e.cmd, "args": e.args,
+            "desc": e.desc, "tags": e.tags, "alias": e.alias,
+            "installed": e.resolved() is not None,
+            "path": e.resolved(), "install": e.install,
+        } for e in rows], ensure_ascii=False, indent=2))
+        return 0
+
+    idw = max([vis_len(e.id) for e in rows] + [4])
+    namew = min(38, max([vis_len(e.name) for e in rows] + [6]))
+    ok_n = sum(1 for e in rows if e.resolved())
+
+    print(f"\n  {C['b']}{C['mag']}ag{C['r']} {C['dim']}Agent Gateway v{VERSION}{C['r']}"
+          f"   {C['gry']}共 {len(rows)} 个 · 已安装 {ok_n}{C['r']}\n")
+    for e in rows:
+        ok = e.resolved() is not None
+        icon = f"{C['grn']}●{C['r']}" if ok else f"{C['red']}○{C['r']}"
+        print(f"  {icon} {C['b']}{pad(e.id, idw)}{C['r']}  "
+              f"{pad(trunc(e.name, namew), namew)}  {C['gry']}{e.desc}{C['r']}")
+        if not ok:
+            hint = e.install or f"检查 cmd={e.cmd}"
+            print(f"      {C['red']}↳ 未安装：{C['r']}{C['gry']}{hint}{C['r']}")
+    print(f"\n  {C['gry']}用法： ag          打开选择器")
+    print(f"         ag <id>     直接启动      ag <id> --help  透传参数")
+    print(f"         ag add      添加新的      ag scan         发现未登记的{C['r']}\n")
+    return 0
+
+
+def cmd_which(entries, args):
+    if not args:
+        return die("用法：ag which <id>")
+    e = find_entry(entries, args[0])
+    if not e:
+        return die(f"注册表里没有 「{args[0]}」")
+    p = e.resolved()
+    print(f"  id    : {e.id}")
+    print(f"  name  : {e.name}")
+    print(f"  命令  : {' '.join(e.argv(args[1:]))}")
+    print(f"  路径  : {p or C['red'] + '（未安装）' + C['r']}")
+    if e.cwd:
+        print(f"  目录  : {e.cwd}")
+    if e.env:
+        print(f"  环境  : {e.env}")
+    return 0
+
+
+def cmd_add(entries, args):
+    import argparse
+    ap = argparse.ArgumentParser(prog="ag add", add_help=True)
+    ap.add_argument("--id"); ap.add_argument("--name"); ap.add_argument("--cmd")
+    ap.add_argument("--args", default=""); ap.add_argument("--desc", default="")
+    ap.add_argument("--tags", default=""); ap.add_argument("--alias", default="")
+    ap.add_argument("--cwd", default=""); ap.add_argument("--install", default="")
+    ap.add_argument("--env", action="append", default=[])
+    ns = ap.parse_args(args)
+
+    data = {}
+    if ns.id:
+        data = dict(id=ns.id, name=ns.name or ns.id, cmd=ns.cmd or ns.id,
+                    args=ns.args.split(), desc=ns.desc,
+                    tags=[t for t in ns.tags.replace(",", " ").split() if t],
+                    alias=[a for a in ns.alias.replace(",", " ").split() if a],
+                    cwd=ns.cwd, install=ns.install,
+                    env=dict(kv.split("=", 1) for kv in ns.env if "=" in kv))
+    else:
+        if not sys.stdin.isatty():
+            return die("非交互环境请用：ag add --id X --cmd Y [...]")
+        print(f"\n  {C['b']}添加新的 agent{C['r']}  {C['gry']}(回车用默认值，Ctrl-C 取消){C['r']}\n")
+
+        def ask(label, default="", hint=""):
+            tail = f" {C['gry']}[{default}]{C['r']}" if default else ""
+            extra = f"  {C['gry']}{hint}{C['r']}" if hint else ""
+            try:
+                v = input(f"  {C['cyn']}{label}{C['r']}{tail}{extra}: ").strip()
+            except EOFError:
+                return default
+            return v or default
+
+        aid = ask("id（短名，如 cc）")
+        if not aid:
+            return die("id 不能为空")
+        if find_entry(entries, aid):
+            return die(f"「{aid}」已存在")
+        data["id"] = aid
+        data["name"] = ask("显示名", aid)
+        data["cmd"] = ask("可执行文件", aid, "（名字或绝对路径）")
+        data["args"] = ask("固定参数（空格分隔）", "").split()
+        data["desc"] = ask("一句话说明", "")
+        data["tags"] = [t for t in ask("标签（逗号或空格分隔）", "").replace(",", " ").split() if t]
+        data["alias"] = [a for a in ask("额外别名", "").replace(",", " ").split() if a]
+        data["install"] = ask("安装命令（可选）", "")
+        data["cwd"] = ask("启动目录（可选）", "")
+
+    e = Entry(data)
+    if find_entry(entries, e.id):
+        return die(f"「{e.id}」已存在，先 ag rm {e.id}")
+    if not shutil.which(e.cmd) and not os.path.exists(os.path.expanduser(e.cmd)):
+        print(f"  {C['yel']}! 警告：{e.cmd} 现在不在 PATH 上（先登记也行，装好了就能用）{C['r']}")
+
+    with open(REGISTRY, "a", encoding="utf-8") as f:
+        f.write("\n# ── 由 `ag add` 添加 ──\n" + render_toml(e))
+
+    print(f"  {C['grn']}✓ 已添加{C['r']} {C['b']}{e.id}{C['r']} → {' '.join(e.argv())}")
+    print(f"  {C['gry']}立刻可用： ag {e.id}{C['r']}\n")
+    return 0
+
+
+def toml_str(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def toml_arr(xs):
+    return "[" + ", ".join(toml_str(x) for x in xs) + "]"
+
+
+def render_toml(e: Entry):
+    L = ["[[agent]]", f"id = {toml_str(e.id)}", f"name = {toml_str(e.name)}",
+         f"cmd = {toml_str(e.cmd)}"]
+    if e.args:
+        L.append(f"args = {toml_arr(e.args)}")
+    if e.desc:
+        L.append(f"desc = {toml_str(e.desc)}")
+    if e.tags:
+        L.append(f"tags = {toml_arr(e.tags)}")
+    if e.alias:
+        L.append(f"alias = {toml_arr(e.alias)}")
+    if e.cwd:
+        L.append(f"cwd = {toml_str(e.cwd)}")
+    if e.env:
+        L.append("env = { " + ", ".join(f"{k} = {toml_str(v)}" for k, v in e.env.items()) + " }")
+    if e.install:
+        L.append(f"install = {toml_str(e.install)}")
+    if e.hidden:
+        L.append("hidden = true")
+    return "\n".join(L) + "\n"
+
+
+def backup_registry():
+    """改注册表前先备份一份。"""
+    import time
+    d = os.path.join(os.path.dirname(REGISTRY), "backups")
+    os.makedirs(d, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dst = os.path.join(d, f"registry.{stamp}.toml")
+    shutil.copy2(REGISTRY, dst)
+    # 只留最近 20 份
+    olds = sorted(f for f in os.listdir(d) if f.startswith("registry."))
+    for f in olds[:-20]:
+        try:
+            os.remove(os.path.join(d, f))
+        except OSError:
+            pass
+    return dst
+
+
+def cmd_rm(entries, args):
+    """按 [[agent]] 块整块删除，保留文件里的注释和别人手写的格式。"""
+    if not args:
+        return die("用法：ag rm <id>")
+    target = find_entry(entries, args[0])
+    if not target:
+        return die(f"注册表里没有 「{args[0]}」")
+
+    names = {a.lower() for a in target.all_ids}
+    with open(REGISTRY, encoding="utf-8") as f:
+        lines = f.readlines()
+
+    out, block, dropped = [], [], 0
+
+    def flush():
+        nonlocal dropped
+        if not block:
+            return
+        # 块尾的注释/空行其实是下一节的小标题，先摘出来，别跟着被删
+        tail = []
+        while len(block) > 1 and (not block[-1].strip()
+                                  or block[-1].lstrip().startswith("#")):
+            tail.insert(0, block.pop())
+        hit = False
+        for ln in block:
+            s = ln.strip()
+            if s.startswith("id") and "=" in s:
+                val = s.split("=", 1)[1].strip().strip('"\'')
+                if val.lower() in names:
+                    hit = True
+            if s.startswith("alias") and "=" in s:
+                for tok in s.split("=", 1)[1].strip().strip("[]").split(","):
+                    if tok.strip().strip('"\' ').lower() in names:
+                        hit = True
+        if hit:
+            dropped += 1
+        else:
+            out.extend(block)
+        out.extend(tail)
+
+    for ln in lines:
+        if ln.lstrip().startswith("[[agent]]"):
+            flush()
+            block = [ln]
+        elif block:
+            block.append(ln)
+        else:
+            out.append(ln)
+    flush()
+
+    if not dropped:
+        return die(f"没找到 {target.id} 的块，注册表可能被手改过；用 ag edit 看看")
+    if not any(x.strip().startswith("[[agent]]") for x in out):
+        out.append("\n# （空）用 `ag add` 加一个吧\n")
+
+    bk = backup_registry()
+    with open(REGISTRY, "w", encoding="utf-8") as f:
+        f.writelines(out)
+    print(f"  {C['grn']}✓ 已删除{C['r']} {C['b']}{target.id}{C['r']}"
+          f"  {C['gry']}({dropped} 块，注释已保留){C['r']}")
+    print(f"  {C['gry']}备份：{bk}{C['r']}")
+    return 0
+
+
+KNOWN_AGENTS = """
+claude codex gemini grok opencode openclaw hermes hermes-agent pi omp prime-agent jcode
+kimi goose omx omc mcode codewhale dsh dsh-tui cursor-agent qwen amp aider cline crush
+continue goose-cli copilot charm opencode-ai clawdhub clawhub agent-browser cua-driver
+qwen-code iflow roo-cline kilo codebuff warp oz
+""".split()
+
+
+def cmd_scan(entries, args):
+    registered = set()
+    for e in entries:
+        registered.add(e.cmd)
+        for a in e.all_ids:
+            registered.add(a)
+    found = []
+    seen = set()
+    for name in KNOWN_AGENTS:
+        if name in seen or name in registered:
+            continue
+        p = shutil.which(name)
+        if p:
+            seen.add(name)
+            found.append((name, p))
+    if not found:
+        print(f"  {C['grn']}✓ 没有发现未登记的 agent{C['r']}")
+        return 0
+    print(f"\n  {C['b']}发现 {len(found)} 个已安装但没登记的 agent：{C['r']}\n")
+    for name, p in found:
+        print(f"  {C['grn']}+{C['r']} {C['b']}{pad(name, 16)}{C['r']} {C['gry']}{p}{C['r']}")
+    print(f"\n  {C['gry']}登记它：  ag add --id {found[0][0]} --cmd {found[0][1]}{C['r']}\n")
+    return 0
+
+
+def cmd_doctor(entries, args):
+    print(f"\n  {C['b']}ag doctor{C['r']}  {C['gry']}注册表：{REGISTRY}{C['r']}\n")
+    bad = 0
+    for e in entries:
+        p = e.resolved()
+        if p:
+            extra = "" if os.path.realpath(p).startswith(HOME) else f"  {C['yel']}(系统目录){C['r']}"
+            print(f"  {C['grn']}●{C['r']} {C['b']}{pad(e.id, 16)}{C['r']} {C['gry']}{p}{C['r']}{extra}")
+        else:
+            bad += 1
+            print(f"  {C['red']}○{C['r']} {C['b']}{pad(e.id, 16)}{C['r']} {C['red']}未安装{C['r']} "
+                  f"{C['gry']}{e.install or 'cmd=' + e.cmd}{C['r']}")
+    print(f"\n  {C['gry']}{len(entries) - bad}/{len(entries)} 可用。"
+          f"装缺失的：  ag install <id>   或   ag install --missing{C['r']}\n")
+    return 0
+
+
+def cmd_install(entries, args):
+    if not args:
+        return die("用法：ag install <id> | ag install --missing")
+    if args[0] == "--missing":
+        todo = [e for e in entries if not e.resolved() and e.install]
+        if not todo:
+            print(f"  {C['grn']}✓ 没有缺失的{C['r']}")
+            return 0
+        for e in todo:
+            print(f"\n  {C['b']}安装 {e.id}{C['r']}  {C['gry']}{e.install}{C['r']}")
+            subprocess.run(e.install, shell=True)
+        return 0
+    e = find_entry(entries, args[0])
+    if not e:
+        return die(f"注册表里没有 「{args[0]}」")
+    if not e.install:
+        return die(f"「{e.id}」没有登记 install 命令，用 ag edit 补上")
+    print(f"  {C['b']}安装 {e.id}{C['r']}  {C['gry']}{e.install}{C['r']}\n")
+    rc = subprocess.run(e.install, shell=True).returncode
+    print(f"\n  {'✓ 完成' if rc == 0 else '✗ 失败 rc=' + str(rc)}")
+    return rc
+
+
+def cmd_edit(entries, args):
+    ed = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
+    return subprocess.run([ed, REGISTRY]).returncode
+
+
+def usage():
+    print(f"""
+  {C['b']}{C['mag']}ag{C['r']} {C['dim']}Agent Gateway v{VERSION}{C['r']}  —  一个命令管住所有 AI coding agent
+
+  {C['b']}启动{C['r']}
+    ag                    打开模糊选择器（输入即筛选，回车启动）
+    ag <id>               直接启动，例： ag cc / ag oc / ag ot-ceo
+    ag <id> [参数...]     透传给 agent，例： ag cc --resume
+    ag <关键词>           没精确匹配时，打开预筛选的选择器
+
+  {C['b']}管理{C['r']}
+    ag ls [--all]         列出全部（--all 含隐藏项）
+    ag ls --json          机器可读，方便接别的脚本
+    ag add                向导式添加新 agent
+    ag add --id x --cmd y --desc "..." --tags a,b --install "..."
+    ag rm <id>            删除
+    ag edit               用 $EDITOR 打开注册表
+    ag scan               扫描 PATH，发现装了但没登记的 agent
+    ag doctor             体检：哪些能跑、哪些缺
+    ag install <id>       按登记的 install 命令安装
+    ag install --missing  一键补装所有缺失的
+    ag which <id>         显示实际会执行的命令
+    ag path               打印注册表路径
+
+  {C['gry']}注册表： {REGISTRY}
+  说明书： {AG_DIR}/README.md
+  加新 agent 不需要改这个脚本，改注册表就行（保存即生效）。{C['r']}
+""")
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    if not os.path.exists(REGISTRY):
+        os.makedirs(AG_DIR, exist_ok=True)
+        open(REGISTRY, "w").write("# ag registry\n")
+
+    entries = load_registry()
+    a = argv[1:]
+
+    if a and a[0] in ("-h", "--help", "help"):
+        return usage()
+    if a and a[0] in ("-v", "--version"):
+        print(f"ag {VERSION}")
+        return 0
+    if a and a[0] == "path":
+        print(REGISTRY)
+        return 0
+
+    sub = {"ls": cmd_ls, "list": cmd_ls, "add": cmd_add, "rm": cmd_rm,
+           "remove": cmd_rm, "edit": cmd_edit, "scan": cmd_scan,
+           "doctor": cmd_doctor, "install": cmd_install, "which": cmd_which}
+
+    if a and a[0] in sub:
+        return sub[a[0]](entries, a[1:])
+
+    if not entries:
+        return die(f"注册表是空的：{REGISTRY}")
+
+    # 无参数 → 选择器
+    if not a:
+        if not sys.stdin.isatty():
+            return cmd_ls(entries, [])
+        e = picker(entries)
+        return cmd_launch(e, []) if e else 0
+
+    # 有参数 → 先精确匹配 id/alias
+    e = find_entry(entries, a[0])
+    if e:
+        return cmd_launch(e, a[1:])
+
+    # 不精确 → 唯一模糊匹配就直接启动，否则开预筛选选择器
+    hits = fuzzy([x for x in entries if not x.hidden], a[0])
+    if len(hits) == 1:
+        return cmd_launch(hits[0][0], a[1:])
+    if not sys.stdin.isatty():
+        return die(f"没有 「{a[0]}」，候选：" +
+                   ", ".join(x.id for x, _ in hits[:8]) if hits else f"没有 「{a[0]}」")
+    e = picker(entries, initial=a[0], prompt=f"筛选「{a[0]}」")
+    return cmd_launch(e, []) if e else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
