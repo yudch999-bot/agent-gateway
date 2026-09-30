@@ -106,20 +106,37 @@ cd agent-gateway
 
 ### 选择器
 
+空筛选时**按组显示**，一打字就切回平铺：
+
 ```
-  ag Agent Gateway  1/29 · 选一个 agent · 输入即筛选
-  ❯ 设
+  ag Agent Gateway  29/29 · 选一个 agent · 输入即筛选
+  ❯
   ────────────────────────────────────────────────────────────
-  ● ot-design     OpenClaw · design 视觉设计师     视觉设计师
+  原厂 CLI ───────────────────────────────────────────────────
+  ● d             DeepSeek Harness       DeepSeek 官方 harness TUI
+  ● cc            Claude Code            Anthropic 官方 CLI
+  ● codex         Codex CLI              OpenAI 官方 CLI
+  OpenClaw 团队 ──────────────────────────────────────────────
+  ● ot            OpenClaw · main 总编辑  主 agent / 总编辑
+  ● ot-ceo        OpenClaw · ceo 内容策划  内容策划
   ────────────────────────────────────────────────────────────
-  openclaw tui --session agent:design:main  tags: openclaw,team
-  ↑↓ 移动 · Enter 启动 · Ctrl-R 续聊 · Ctrl-T 置顶 · Ctrl-O 配置 · ? 帮助 · Esc 退出
+  dsh-tui  Ctrl-R 续聊  tags: deepseek,official
+  ↑↓ 移动 · Tab 多选 · Ctrl-R 续聊 · Ctrl-T 置顶 · Ctrl-O 配置 · ? 帮助 · Esc 退出
+```
+
+组名来自注册表的 `group` 字段。只想看一组，打 `@`：
+
+```
+@openclaw        只看 OpenClaw 那一组（9 条）
+@openclaw ceo    组内再搜
+@增强            中文组名也行
 ```
 
 | 按键 | 作用 |
 |---|---|
 | 直接打字 | 追加筛选词（**支持中文**） |
 | **`Tab`** | **多选 —— 勾几个，Enter 一次全开** |
+| **`@组名`** | **只看某一组**，例 `@openclaw`；后面还能接着打字 |
 | `↑` `↓` / `Ctrl-P` `Ctrl-N` | 移动 |
 | `PgUp` `PgDn` / `Home` `End` | 翻页 / 跳首尾 |
 | `Backspace` / `Ctrl-U` | 删一字 / 清空 |
@@ -133,6 +150,7 @@ cd agent-gateway
 **排序会学习你的习惯**：空查询时按 *置顶 > 常用程度 > 注册表顺序* 排。
 常用程度 = 用过的次数按 **14 天半衰期** 衰减 —— 常用来的一直在前面，
 偶尔翻出来的老古董会自然沉下去。一打字就切回按命中质量排。
+**组间同理** —— 拿每组最常用的那个比，所以常用的组会浮上来。
 
 搜索范围：**短名、显示名、说明、标签、别名**，中英文都行。
 
@@ -388,6 +406,8 @@ cwd = "~/work"                # 启动目录，支持 ~
 install = "npm i -g myagent"  # 给 `ag install` 用
 update = "npm i -g myagent@latest"   # 给 `ag update` 用（不给就退回 install）
 resume = ["--resume"]         # 续聊参数，给 `ag resume` / Ctrl-R 用
+sessions = "~/.myagent/sessions"     # 会话历史目录，给 `ag search` / `ag handoff` 用
+group = "我的工具"             # 选择器里的分组标题；不填归到「其它」
 hidden = false                # true 则不进选择器
 ```
 

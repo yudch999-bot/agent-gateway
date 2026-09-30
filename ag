@@ -54,7 +54,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -75,7 +75,8 @@ else:
 
 class Entry:
     __slots__ = ("id", "name", "cmd", "args", "desc", "tags", "alias", "env",
-                 "cwd", "install", "update", "resume", "sessions", "hidden", "raw")
+                 "cwd", "install", "update", "resume", "sessions", "group",
+                 "hidden", "raw")
 
     def __init__(self, d: dict):
         self.raw = d
@@ -96,6 +97,8 @@ class Entry:
         # 会话历史目录，给 ag search / ag handoff 用。
         # 各家格式私有，所以这里只记「去哪找」，解析交给下面的通用提取器。
         self.sessions = str(d.get("sessions", "")).strip()
+        # 选择器里的分组标题。不填就归到「其它」，永远排在最后。
+        self.group = str(d.get("group", "")).strip()
         self.hidden = bool(d.get("hidden", False))
 
     @property
@@ -334,6 +337,46 @@ def order_hits(hits, usage, pins, query="", entries=None):
                        len(t[0].id),
                        t[0].id),
     )
+
+
+OTHER_GROUP = "其它"
+
+
+def parse_query(q):
+    """把 '@openclaw ceo' 拆成 (组过滤, 剩余关键词)。没有 @ 就返回 (None, 原样)。"""
+    q = (q or "").strip()
+    if not q.startswith("@"):
+        return None, q
+    parts = q[1:].split(None, 1)
+    return (parts[0].lower() if parts else ""), (parts[1] if len(parts) > 1 else "")
+
+
+def grouped(items, usage, pins, entries=None):
+    """-> [(组名, [条目...]), ...]
+
+    组内排序：置顶 > 常用 > 注册表原顺序。
+    组间排序：拿「该组第一位」的排序键比 —— 所以常用的组会浮上来，
+    frecency 的好处没丢；一次没用过时就是注册表里那套逻辑顺序。
+    「其它」永远垫底。
+    """
+    frec = frecency(usage)
+    pin_set = set(pins)
+    reg_order = {e.id: i for i, e in enumerate(entries or items)}
+    buckets = {}
+    for e in items:
+        buckets.setdefault(e.group or OTHER_GROUP, []).append(e)
+
+    def rank(e):
+        # 最后那个 e.id 只是兜底的稳定排序，正常轮不到
+        return (e.id not in pin_set, -frec.get(e.id, 0.0),
+                reg_order.get(e.id, 9999), e.id)
+
+    out = []
+    for g, es in buckets.items():
+        es.sort(key=rank)
+        out.append((g, es, rank(es[0])))
+    out.sort(key=lambda t: (t[0] == OTHER_GROUP, t[2]))
+    return [(g, es) for g, es, _ in out]
 
 
 def human_age(ts, now=None):
@@ -1075,16 +1118,52 @@ def picker(entries, initial="", prompt="选一个 agent"):
         enter_alt()
 
         while True:
-            hits = order_hits(fuzzy(visible, query), usage, pins,
-                              query=query, entries=visible)
+            gfilter, kw = parse_query(query)
+            pool = visible
+            if gfilter is not None:
+                pool = [e for e in visible
+                        if gfilter in (e.group or OTHER_GROUP).lower()]
+            hits = order_hits(fuzzy(pool, kw), usage, pins,
+                              query=kw, entries=pool)
             items = [e for e, _ in hits]
+            # 空关键词（或只按组过滤）时按组显示，一打字就切回平铺
+            groups = (grouped(items, usage, pins, entries=visible)
+                      if not kw.strip() else None)
             if cursor >= len(items):
                 cursor = max(0, len(items) - 1)
 
             W = term_width()
             H = shutil.get_terminal_size((100, 24)).lines
             list_h = max(5, H - 6)
-            top = max(0, min(cursor - list_h // 2, len(items) - list_h))
+
+            # 组标题也要占行，所以先摊成「显示行」，光标定位按显示行算，
+            # 不然滚到后面光标会跑出可视区
+            # ("h", 标题) 或 ("i", 条目, 它在 items 里的下标)
+            rows = []
+            if groups:
+                for gname, es in groups:
+                    rows.append(("h", gname))
+                    idx_of = {id(e): k for k, e in enumerate(items)}
+                    rows.extend(("i", e, idx_of.get(id(e), 0)) for e in es)
+            else:
+                rows = [("i", e, i) for i, e in enumerate(items)]
+
+            # 标题行也要占地方，先扣掉
+            head_lines = sum(1 for r in rows if r[0] == "h")
+            list_h = max(5, list_h - min(head_lines, 6))
+
+            item_rows = [i for i, r in enumerate(rows) if r[0] == "i"]
+            if cursor >= len(item_rows):
+                cursor = max(0, len(item_rows) - 1)
+            cur_row = item_rows[cursor] if item_rows else 0
+            top = max(0, min(cur_row - list_h // 2, max(0, len(rows) - list_h)))
+            shown = rows[top:top + list_h]
+            # 首行别是孤零零一条 —— 它上面的组标题被滚掉了
+            if shown and shown[0][0] == "i" and top > 0 and rows[top - 1][0] == "h":
+                shown = rows[top - 1:top - 1 + list_h]
+            # 末行别只剩个组标题，下面一条都没有
+            while len(shown) > 1 and shown[-1][0] == "h":
+                shown = shown[:-1]
 
             out = ["\033[H\033[2J"]
             sel_note = (f"  {C['cyn']}{C['b']}已选 {len(selected)}{C['r']}"
@@ -1131,8 +1210,14 @@ def picker(entries, initial="", prompt="选一个 agent"):
                 out.append(f"\r\n  {C['yel']}没有匹配的 agent{C['r']}\r\n")
 
             pin_set = set(pins)
-            for i in range(top, min(top + list_h, len(items))):
-                e = items[i]
+            for row in shown:
+                if row[0] == "h":
+                    gname = row[1]
+                    rule = "─" * max(4, min(W - 8, 92) - vis_len(gname))
+                    out.append(f"  {C['mag']}{C['b']}{gname}{C['r']}"
+                               f" {C['gry']}{rule}{C['r']}\r\n")
+                    continue
+                _, e, i = row
                 ok = e.resolved() is not None
                 pinned = e.id in pin_set
                 idc = pad(e.id, idw)
@@ -1275,6 +1360,7 @@ def render_help(W):
     rows = [
         ("", "按键"),
         ("直接打字", "追加筛选词（支持中文、多关键词空格分隔）"),
+        ("@组名", "只看某一组，例 @openclaw / @hermes；后面还能接着打字"),
         ("↑ ↓ / Ctrl-P Ctrl-N", "上下移动"),
         ("PgUp PgDn / Home End", "翻页 / 跳首尾"),
         ("Backspace", "删一个字符"),
@@ -1286,6 +1372,11 @@ def render_help(W):
         ("Ctrl-O", "打开该 agent 的配置目录"),
         ("?", "显示 / 关闭这个帮助"),
         ("Esc / Ctrl-C", "退出，什么都不启动"),
+        ("", ""),
+        ("", "关于分组"),
+        ("", "空筛选时按组显示，组名来自注册表的 group 字段。"),
+        ("", "组间按「该组最常用的那个」排，所以常用的组会浮上来；"),
+        ("", "一打字就切回平铺，按命中质量排。"),
         ("", ""),
         ("", "关于排序"),
         ("", "空查询时按 置顶 > 常用程度 排；一打字就按命中质量排。"),
@@ -2254,6 +2345,8 @@ def render_toml(e: Entry):
         L.append(f"resume = {toml_arr(e.resume)}")
     if e.sessions:
         L.append(f"sessions = {toml_str(e.sessions)}")
+    if e.group:
+        L.append(f"group = {toml_str(e.group)}")
     if e.hidden:
         L.append("hidden = true")
     return "\n".join(L) + "\n"
@@ -2441,6 +2534,7 @@ def usage():
     ag <id>               直接启动，例： ag cc / ag oc / ag ot-ceo
     ag <id> [参数...]     透传给 agent
     ag <关键词>           没精确匹配时，打开预筛选的选择器
+    ag @组名              只看某一组，例 ag @openclaw（选择器里也一样）
 
   {C['b']}一次开多个（tmux 窗口/分屏）{C['r']}
     ag team               打开多选器，勾几个就开几个

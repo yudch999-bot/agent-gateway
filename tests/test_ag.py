@@ -138,6 +138,9 @@ def run(seq, argv=None):
 
 strip = lambda s: re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", s)
 frames_of = lambda out: out.split("\033[H\033[2J")
+def last_frame(out):
+    """很多断言只该看最后一帧 —— strip(out) 会把历史帧也算进来。"""
+    return strip(frames_of(out)[-1])
 
 fail = []
 def check(name, cond, extra=""):
@@ -885,6 +888,99 @@ finally:
     ag.shutil, ag.subprocess = saved_shutil, saved_sub
     if saved_tmux_env is not None:
         os.environ["TMUX"] = saved_tmux_env
+
+say()
+say("19) 分组显示与 @ 过滤")
+
+say("  · group 字段")
+ge = ag.Entry(dict(id="x", cmd="echo", group="我的组", desc="d"))
+check("group 读得出来", ge.group == "我的组")
+check("不填 group 时是空串", ag.Entry(dict(id="y", cmd="echo")).group == "")
+blk = ag.render_toml(ge)
+check("render_toml 写出 group", 'group = "我的组"' in blk, blk)
+open("/tmp/gg.toml", "w").write("[[agent]]\n" + blk)
+check("往返无损", ag.load_registry("/tmp/gg.toml")[0].group == "我的组")
+
+say("  · parse_query")
+for q, want in [("@openclaw", ("openclaw", "")),
+                ("@openclaw ceo", ("openclaw", "ceo")),
+                ("@Hermes", ("hermes", "")),
+                ("ceo", (None, "ceo")),
+                ("", (None, "")),
+                ("@", ("", "")),
+                ("@a b c", ("a", "b c"))]:
+    got = ag.parse_query(q)
+    check(f"{q!r} → {want}", got == want, str(got))
+
+say("  · grouped 排序")
+def mk(i, g, c="echo"):
+    return ag.Entry(dict(id=i, cmd=c, group=g))
+items = [mk("a1", "甲"), mk("a2", "甲"), mk("b1", "乙"), mk("z9", "")]
+NOW2 = 1_800_000_000.0
+g1 = ag.grouped(items, {"a2": [NOW2 - 60]}, [], entries=items)
+check("组名都在", [g for g, _ in g1] == ["甲", "乙", "其它"], str([g for g, _ in g1]))
+check("其它永远垫底", g1[-1][0] == "其它")
+check("用过的组浮到前面（甲里有 a2 常用）", g1[0][0] == "甲", str(g1[0][0]))
+check("组内用过的排前面", [e.id for e in g1[0][1]] == ["a2", "a1"],
+      str([e.id for e in g1[0][1]]))
+
+g2 = ag.grouped(items, {}, ["b1"], entries=items)
+check("有置顶的组排最前", g2[0][0] == "乙", str([g for g, _ in g2]))
+check("置顶的组内也排第一", g2[0][1][0].id == "b1")
+
+g3 = ag.grouped(items, {}, [], entries=items)
+check("都没有记录时按注册表顺序", [g for g, _ in g3] == ["甲", "乙", "其它"],
+      str([g for g, _ in g3]))
+check("组内也按注册表顺序", [e.id for e in g3[0][1]] == ["a1", "a2"])
+
+say("  · 选择器：空查询按组显示，一打字就平铺")
+out, got, _ = run([ESC])
+txt = last_frame(out)
+check("空查询有组标题", "原厂 CLI" in txt, txt[:300])
+check("组标题带横线分隔", "─" in txt.split("原厂 CLI")[1][:6], repr(txt.split("原厂 CLI")[1][:10]))
+# 别写成「某几个组标题都得在」—— 那取决于终端高度，太脆。
+# 真正要保证的是排版规矩：窗口最后一行不能是个孤零零的组标题。
+# 纯分隔线（整行都是 ─）不算内容，先滤掉，再掐头去尾
+body = [l for l in txt.splitlines()
+        if l.strip() and set(l.strip()) != {"─"}]
+body = body[2:-2]                      # 去掉头部两行和底部两行
+if body:
+    check("窗口末尾不是孤立的组标题（上面没内容）",
+          "─" not in body[-1] or "●" in body[-1], repr(body[-1][:70]))
+    check("开头也不是孤立条目（组标题被滚掉了）",
+          "●" not in body[0] or "─" in body[0], repr(body[0][:70]))
+out, got, _ = run([b"c", b"c", ESC])
+check("打了关键词就不显示组标题", "原厂 CLI" not in last_frame(out), last_frame(out)[:300])
+
+say("  · 选择器：@ 过滤")
+out, got, _ = run([b"@", b"h", b"e", b"r", ESC])
+txt = last_frame(out)
+check("@her 只剩 Hermes 组", "Hermes" in txt and "原厂 CLI" not in txt, txt[:300])
+check("@ 过滤时计数正确", "3/29" in txt, txt[:200])
+out, got, _ = run([b"@", b"n", b"o", b"s", b"u", b"c", b"h", ESC])
+check("不存在的组给空态而不是崩", "没有匹配" in strip(out), strip(out)[:300])
+
+out, got, _ = run([b"@", b"o", b"p", b"e", b"n", b"c", b"l", b"a", b"w",
+                   b" ", b"c", b"e", b"o", ENTER])
+check("@组 + 关键词能定位到具体条目", got.get("launched", ("",))[0] == "ot-ceo",
+      str(got.get("launched")))
+
+say("  · 跨组多选")
+out, got, _ = run([TAB, b"\x1b[B", b"\x1b[B", b"\x1b[B", b"\x1b[B", b"\x1b[B",
+                   b"\x1b[B", b"\x1b[B", b"\x1b[B", TAB, ENTER])
+ids_picked = got.get("many", [])
+check("能跨组选两个", len(ids_picked) == 2, str(ids_picked))
+
+say("  · 注册表分组完整性")
+reg_g = ag.load_registry()
+groups_seen = {}
+for e in reg_g:
+    groups_seen.setdefault(e.group or ag.OTHER_GROUP, []).append(e.id)
+say("  · " + " | ".join(f"{g}: {len(v)}" for g, v in groups_seen.items()))
+check("示例注册表每条都有 group", all(e.group for e in reg_g),
+      str([e.id for e in reg_g if not e.group]))
+check("分组数在合理范围（2~8 组）", 2 <= len(groups_seen) <= 8, str(len(groups_seen)))
+check("没有空组", all(v for v in groups_seen.values()))
 
 say()
 say("=" * 64)
