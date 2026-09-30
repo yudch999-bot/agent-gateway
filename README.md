@@ -1,5 +1,9 @@
 # ag — Agent Gateway
 
+[![test](https://github.com/yudch999-bot/agent-gateway/actions/workflows/test.yml/badge.svg)](https://github.com/yudch999-bot/agent-gateway/actions/workflows/test.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+
 **One command to launch and switch between all your AI coding agents.**
 
 Claude Code, Codex, Gemini, Grok, OpenCode, OpenClaw, Hermes, Pi, Goose, Kimi…
