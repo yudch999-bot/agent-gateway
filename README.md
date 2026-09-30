@@ -10,6 +10,15 @@ Claude Code, Codex, Gemini, Grok, OpenCode, OpenClaw, Hermes, Pi, Goose, Kimi…
 Stop memorizing a dozen different launch commands and a dozen shell aliases.
 Put them all behind one fuzzy picker, and add your own by editing one line.
 
+它管三层：
+
+| 层 | 命令 | 解决什么 |
+|---|---|---|
+| **开哪个** | `ag` / `ag cc` | 十几套启动方式记不住 |
+| **接着哪个干** | `ag last` / `ag resume` / `Ctrl-R` | 每次都要重新交代上下文 |
+| **翻旧账 / 搬家** | `ag search` / `ag handoff` | 1.8G 会话历史躺着睡觉 |
+| 顺带 | `ag outdated` / `ag update` / `ag stats` / `ag pin` | 批量运维、看习惯 |
+
 ![demo](docs/demo.gif)
 
 ```bash

@@ -53,7 +53,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
