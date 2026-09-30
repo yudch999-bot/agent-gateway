@@ -39,6 +39,7 @@ import textwrap
 import tomllib
 import json
 import time
+import re
 
 # ---------------------------------------------------------------- 常量
 
@@ -910,6 +911,195 @@ def cmd_pin(entries, args, remove=False):
     return 0
 
 
+# ---------------------------------------------------------------- 批量升级
+
+NPM_RE = re.compile(r"\bnpm\s+(?:i|install|add)\s+(?:-g|--global)\s+([^\s;&|]+)")
+BREW_RE = re.compile(r"\bbrew\s+(?:install|upgrade)\s+([^\s;&|]+)")
+
+
+def update_command(e: Entry):
+    """升级命令：优先 update 字段，没写就退回 install。
+
+    多数 agent 的 install 本身就是幂等的「装最新版」，直接重跑就等于升级，
+    所以不强制每条都写 update。
+    """
+    return e.update or e.install
+
+
+def npm_package(cmd_string):
+    """从命令里抠出 npm 包名。 npm i -g @scope/pkg@latest -> @scope/pkg"""
+    m = NPM_RE.search(cmd_string or "")
+    if not m:
+        return None
+    pkg = m.group(1)
+    # 去掉 @latest / @1.2.3 这类 tag，但保留开头的 scope @
+    if pkg.startswith("@"):
+        head, _, tail = pkg.partition("/")
+        return head + "/" + tail.split("@", 1)[0] if tail else pkg
+    return pkg.split("@", 1)[0]
+
+
+def brew_package(cmd_string):
+    m = BREW_RE.search(cmd_string or "")
+    return m.group(1) if m else None
+
+
+def cmd_outdated(entries, args):
+    """看哪些 agent 有新版本。能查的查，查不了的说明白。"""
+    as_json = "--json" in args
+    npm_out, brew_out = {}, {}
+
+    if shutil.which("npm"):
+        try:
+            r = subprocess.run(["npm", "outdated", "-g", "--json"],
+                               capture_output=True, text=True, timeout=90)
+            npm_out = json.loads(r.stdout or "{}")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            npm_out = {}
+
+    if shutil.which("brew"):
+        try:
+            r = subprocess.run(["brew", "outdated", "--json=v2"],
+                               capture_output=True, text=True, timeout=90)
+            data = json.loads(r.stdout or "{}")
+            for f in data.get("formulae", []):
+                brew_out[f.get("name", "")] = {
+                    "current": (f.get("installed_versions") or ["?"])[0],
+                    "latest": f.get("current_version", "?"),
+                }
+        except (OSError, ValueError, subprocess.SubprocessError):
+            brew_out = {}
+
+    rows, unknown, seen_cmd = [], [], set()
+    for e in entries:
+        if e.hidden:
+            continue
+        cmd = update_command(e)
+        if not cmd:
+            continue          # 自己没有安装命令的（比如 ot-* 那些会话入口）跳过
+        if cmd in seen_cmd:
+            continue          # 同一条命令被多个短名共用，只报一次
+        seen_cmd.add(cmd)
+        pkg = npm_package(cmd)
+        bpkg = brew_package(cmd)
+        info = npm_out.get(pkg) if pkg else None
+        if info is None and bpkg:
+            info = brew_out.get(bpkg)
+        if info:
+            rows.append((e, info.get("current", "?"), info.get("latest", "?")))
+        elif pkg or bpkg:
+            rows.append((e, "?", "?"))       # 能查但没在 outdated 里 = 已是最新
+        else:
+            unknown.append(e)
+
+    if as_json:
+        print(json.dumps({
+            "outdated": [{"id": e.id, "package": npm_package(update_command(e))
+                          or brew_package(update_command(e)),
+                          "current": c, "latest": l}
+                         for e, c, l in rows if c != l],
+            "unknown": [e.id for e in unknown],
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    stale = [(e, c, l) for e, c, l in rows if c != l]
+    fresh = [(e, c, l) for e, c, l in rows if c == l]
+
+    print(f"\n  {C['b']}版本检查{C['r']}  {C['gry']}能查的 {len(rows)} 条 · "
+          f"查不了版本的 {len(unknown)} 条{C['r']}\n")
+
+    if stale:
+        print(f"  {C['yel']}需要升级 {len(stale)} 条：{C['r']}")
+        idw = max([vis_len(e.id) for e, _, _ in stale] + [4])
+        for e, cur, lat in stale:
+            print(f"    {C['b']}{pad(e.id, idw)}{C['r']}  "
+                  f"{C['red']}{trunc(cur, 18)}{C['r']} → {C['grn']}{lat}{C['r']}  "
+                  f"{C['gry']}{trunc(e.name, 30)}{C['r']}")
+        print(f"\n  {C['gry']}升级：{C['cyn']}ag update{C['r']}"
+              f"{C['gry']}（或 ag update {' '.join(e.id for e, _, _ in stale[:3])}）{C['r']}")
+    else:
+        print(f"  {C['grn']}✓ 能查到版本的都已是最新{C['r']}")
+
+    if fresh:
+        print(f"\n  {C['gry']}已是最新 {len(fresh)} 条："
+              f"{', '.join(e.id for e, _, _ in fresh)}{C['r']}")
+    if unknown:
+        print(f"\n  {C['gry']}查不了版本 {len(unknown)} 条（重跑安装脚本即升级）："
+              f"{', '.join(e.id for e in unknown)}{C['r']}")
+    print()
+    return 0
+
+
+def cmd_update(entries, args):
+    """批量升级。命令来自注册表的 update 字段，没写就用 install。"""
+    dry = "--dry-run" in args or "-n" in args
+    ids = [a for a in args if not a.startswith("-")]
+
+    if ids:
+        targets = []
+        for a in ids:
+            e = find_entry(entries, a)
+            if not e:
+                return die(f"注册表里没有 「{a}」")
+            targets.append(e)
+    else:
+        targets = [e for e in entries if not e.hidden and update_command(e)]
+
+    targets = [e for e in targets if update_command(e)]
+    if not targets:
+        return die("没有可升级的条目（都没有 update / install 命令）")
+
+    if not ids and not dry and not sys.stdin.isatty() and "--all" not in args:
+        return die("非交互环境下要升级全部，请明确加 --all")
+
+    if not ids and not dry and "--all" not in args and sys.stdin.isatty():
+        print(f"\n  {C['b']}将要执行 {len(targets)} 条升级命令：{C['r']}\n")
+        for e in targets:
+            print(f"    {C['b']}{pad(e.id, 14)}{C['r']} "
+                  f"{C['gry']}{trunc(update_command(e), 60)}{C['r']}")
+        print(f"\n  {C['yel']}!{C['r']} 其中有些是 {C['cyn']}curl ... | sh{C['r']}"
+              f" —— 直接执行远端脚本，自己心里有数")
+        try:
+            ans = input(f"\n  继续？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if ans not in ("y", "yes"):
+            print(f"  {C['gry']}已取消{C['r']}\n")
+            return 0
+
+    if dry:
+        print(f"\n  {C['b']}将执行 {len(targets)} 条（--dry-run，没真跑）：{C['r']}\n")
+        for e in targets:
+            print(f"    {C['b']}{pad(e.id, 14)}{C['r']} "
+                  f"{C['cyn']}{update_command(e)}{C['r']}")
+        print()
+        return 0
+
+    ok, bad = [], []
+    for i, e in enumerate(targets, 1):
+        print(f"\n  {C['gry']}[{i}/{len(targets)}]{C['r']} {C['b']}{e.name}{C['r']} "
+              f"{C['gry']}({e.id}){C['r']}")
+        print(f"  {C['dim']}$ {update_command(e)}{C['r']}\n")
+        sys.stdout.flush()
+        try:
+            rc = subprocess.run(update_command(e), shell=True).returncode
+        except OSError as ex:
+            print(f"  {C['red']}执行失败：{ex}{C['r']}")
+            rc = 1
+        (ok if rc == 0 else bad).append(e.id)
+
+    print(f"\n  {'─' * 50}")
+    if ok:
+        print(f"  {C['grn']}✓ 成功 {len(ok)} 条{C['r']}：{', '.join(ok)}")
+    if bad:
+        print(f"  {C['red']}✗ 失败 {len(bad)} 条{C['r']}：{', '.join(bad)}")
+        print(f"  {C['gry']}失败的多半是网络问题，单独重试："
+              f"{C['cyn']}ag update {' '.join(bad)}{C['r']}")
+    print()
+    return 0 if not bad else 1
+
+
 # ---------------------------------------------------------------- 统计
 
 def cmd_stats(entries, args):
@@ -1243,6 +1433,12 @@ def usage():
     ag unpin <id...>      取消置顶
     ag stats [--history]  使用统计 / 最近启动时间线
 
+  {C['b']}升级{C['r']}
+    ag outdated           看哪些有新版本（npm / brew 能查的都查）
+    ag update [id...]     升级。不带 id 会先列出命令再问一次
+    ag update --all       升级全部，不问
+    ag update --dry-run   只看会执行什么，不真跑
+
   {C['b']}管理{C['r']}
     ag ls [--all]         列出全部（--all 含隐藏项）
     ag ls --json          机器可读，方便接别的脚本
@@ -1289,7 +1485,9 @@ def main(argv):
            "resume": cmd_resume, "r": cmd_resume,
            "last": cmd_last, "l": cmd_last,
            "pin": cmd_pin, "unpin": lambda es, ar: cmd_pin(es, ar, remove=True),
-           "stats": cmd_stats}
+           "stats": cmd_stats,
+           "update": cmd_update, "upgrade": cmd_update, "up": cmd_update,
+           "outdated": cmd_outdated, "old": cmd_outdated}
 
     if a and a[0] in sub:
         return sub[a[0]](entries, a[1:])

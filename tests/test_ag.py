@@ -417,6 +417,87 @@ rc, o = runcmd(["stats", "--history"])
 check("ag stats --history 出时间线", rc == 0 and "最近的启动" in o)
 
 say()
+say("15) 批量升级：命令提取与执行")
+say("  · 包名提取")
+for cmd, want in [("npm i -g @scope/pkg@latest", "@scope/pkg"),
+                  ("npm install -g oh-my-codex", "oh-my-codex"),
+                  ("npm i -g openclaw@latest", "openclaw"),
+                  ("curl -fsSL https://x.sh | bash", None),
+                  ("echo npm i -g plain", "plain")]:
+    got_pkg = ag.npm_package(cmd)
+    check(f"npm_package({cmd[:34]}…) → {want}", got_pkg == want, str(got_pkg))
+check("brew_package 提取", ag.brew_package("brew install can1357/tap/omp") == "can1357/tap/omp",
+      str(ag.brew_package("brew install can1357/tap/omp")))
+check("brew_package 对 curl 返回 None", ag.brew_package("curl x | sh") is None)
+
+say("  · update 缺省回退到 install")
+e_fb = ag.Entry(dict(id="fb", cmd="echo", install="echo from-install"))
+e_up = ag.Entry(dict(id="up", cmd="echo", install="echo from-install", update="echo from-update"))
+check("没写 update 就用 install", ag.update_command(e_fb) == "echo from-install")
+check("写了 update 就用 update", ag.update_command(e_up) == "echo from-update")
+
+say("  · 真的执行（沙箱注册表，全是 echo，不动真实环境）")
+UPD_DIR = tempfile.mkdtemp(prefix="ag-upd-")
+UPD_REG = os.path.join(UPD_DIR, "registry.toml")
+with open(UPD_REG, "w", encoding="utf-8") as f:
+    f.write('''
+[[agent]]
+id = "g1"
+name = "成功的"
+cmd = "echo"
+update = "echo UPDATED-g1"
+
+[[agent]]
+id = "g2"
+name = "靠 install 回退"
+cmd = "echo"
+install = "echo UPDATED-g2"
+
+[[agent]]
+id = "b1"
+name = "会失败的"
+cmd = "echo"
+update = "exit 3"
+
+[[agent]]
+id = "nocmd"
+name = "没有升级命令"
+cmd = "echo"
+''')
+
+saved_reg = ag.REGISTRY
+ag.REGISTRY = UPD_REG
+try:
+    rc, o = runcmd(["update", "--dry-run"])
+    check("--dry-run 只列不跑", rc == 0 and "UPDATED-g1" in o and "没真跑" in o)
+    check("--dry-run 不碰没有升级命令的条目", "nocmd" not in o)
+
+    rc, o = runcmd(["update", "g1"])
+    check("指定 id 能升级", rc == 0 and "UPDATED-g1" in o)
+    check("没有升级命令的会报错", runcmd(["update", "nocmd"])[0] != 0)
+
+    rc, o = runcmd(["update", "--all"])
+    check("--all 跑全部，失败的让退出码非 0", rc == 1, str(rc))
+    check("成功的都跑了", "UPDATED-g1" in o and "UPDATED-g2" in o)
+    check("失败的有单独汇报", "失败 1 条" in o and "b1" in o)
+
+    # 非交互且没给 --all 时必须拦住，否则脚本里一句 ag update 就把全机器刷了
+    saved_stdin = ag.sys.stdin
+    ag.sys.stdin = io.StringIO()      # 没有 isatty
+    try:
+        rc, o = runcmd(["update"])
+    finally:
+        ag.sys.stdin = saved_stdin
+    check("非交互不给 --all 就拒绝执行", rc != 0, str(rc))
+
+    # outdated 的包名映射：拿假数据走一遍分支，不真跑 npm
+    rc, o = runcmd(["outdated", "--json"])
+    check("outdated --json 输出合法 JSON", rc == 0 and json.loads(o) is not None)
+finally:
+    ag.REGISTRY = saved_reg
+    shutil.rmtree(UPD_DIR, ignore_errors=True)
+
+say()
 say("=" * 64)
 if fail:
     say(f"❌ {len(fail)} 项失败： {fail}")

@@ -141,6 +141,10 @@ ag deepseek    →  d
 | `ag doctor` | 体检：逐条解析真实路径 |
 | `ag install <id>` | 按登记的 `install` 命令安装 |
 | `ag install --missing` | 一键补装所有缺失的 |
+| **`ag outdated`** | **看哪些有新版本**（npm / brew 能查的都查） |
+| **`ag update [id...]`** | **批量升级**，不带 id 会先列出命令再确认 |
+| `ag update --all` | 全部升级，不问 |
+| `ag update --dry-run` | 只看会执行什么，不真跑 |
 | `ag which <id>` | 看实际会执行什么、在哪 |
 | `ag pin [id...]` | 置顶（不带参数列出当前置顶） |
 | `ag unpin <id...>` | 取消置顶 |
