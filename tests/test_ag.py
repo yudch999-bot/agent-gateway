@@ -1132,6 +1132,195 @@ finally:
         os.environ["TMUX"] = saved_tmux2
 
 say()
+say("21) 多开组合：ag team @名字 / ag teams / --save / --rm")
+ag.shutil = _real_shutil                     # --save/--rm 要真 shutil（备份用 copy2）
+
+TEAM_DIR = tempfile.mkdtemp(prefix="ag-team-")
+TEAM_REG = os.path.join(TEAM_DIR, "registry.toml")
+with open(TEAM_REG, "w", encoding="utf-8") as f:
+    f.write('''
+# 顶部注释
+[[agent]]
+id = "a1"
+name = "甲"
+cmd = "echo"
+
+[[agent]]
+id = "a2"
+name = "乙"
+cmd = "echo"
+
+[[agent]]
+id = "a3"
+name = "丙"
+cmd = "echo"
+
+# ---------- 组合区 ----------
+[[team]]
+id = "pair"
+name = "一对"
+desc = "一个写一个查"
+agents = ["a1", "a2"]
+
+[[team]]
+id = "win"
+agents = ["a1", "a3"]
+layout = "windows"
+resume = true
+session = "zz"
+
+[[team]]
+id = "gr"
+agents = ["a1", "a2", "a3"]
+grid = "3x1"
+
+[[team]]
+id = "bad"
+agents = ["a1", "ghost"]
+
+# 文件结尾注释
+''')
+
+saved_reg = ag.REGISTRY
+ag.REGISTRY = TEAM_REG
+try:
+    teams = ag.load_teams()
+    check("load_teams 读到全部组合", [t.id for t in teams] ==
+          ["pair", "win", "gr", "bad"], str([t.id for t in teams]))
+    check("load_registry 不把 team 当 agent",
+          [e.id for e in ag.load_registry()] == ["a1", "a2", "a3"])
+    check("find_team 带 @ 能找", ag.find_team(teams, "@pair").id == "pair")
+    check("find_team 不带 @ 也能找、大小写不敏感",
+          ag.find_team(teams, "PAIR").id == "pair")
+    check("layout / resume / session 解析正确",
+          teams[1].layout == "windows" and teams[1].resume is True
+          and teams[1].session == "zz", str(teams[1].raw))
+    check("grid 解析成 (列, 行)", teams[2].grid == (3, 1), str(teams[2].grid))
+    open("/tmp/zzteam-empty.toml", "w", encoding="utf-8").write(
+        '[[team]]\nid = "empty"\nagents = []\n\n'
+        '[[team]]\nid = "one"\nagents = "a1"\n')
+    leftovers = ag.load_teams("/tmp/zzteam-empty.toml")
+    check("空 agents 的组合被丢掉",
+          [t.id for t in leftovers] == ["one"], str([t.id for t in leftovers]))
+    check("agents 写成单个字符串也认", leftovers[0].agents == ["a1"],
+          str(leftovers[0].agents))
+
+    say("  · render_team_toml 往返")
+    t0 = ag.Team(dict(id="zz-team", name='带"引号"', desc="写\\反斜杠",
+                      agents=["a1", "a2"], layout="windows", grid="2x1",
+                      resume=True, session="s 1"))
+    blk = ag.render_team_toml(t0)
+    say("  ── 生成的 TOML ──")
+    for l in blk.splitlines(): say("   │", l)
+    open("/tmp/zzteam.toml", "w", encoding="utf-8").write(blk)
+    back = ag.load_teams("/tmp/zzteam.toml")[0]
+    check("组合 TOML 往返无损",
+          (back.id, back.name, back.desc, back.agents, back.layout,
+           back.grid, back.resume, back.session)
+          == (t0.id, t0.name, t0.desc, t0.agents, t0.layout,
+              t0.grid, t0.resume, t0.session), str(back.raw))
+    check("默认值不写进 TOML（照默认走）",
+          "layout" not in ag.render_team_toml(
+              ag.Team(dict(id="d", agents=["a1"]))))
+
+    say("  · ag team @组合名：按保存的设置开")
+    cap = {}
+
+    def fake_many(ents, layout="grid", resume=False, session=None, grid=None):
+        cap.update(ids=[e.id for e in ents], layout=layout, resume=resume,
+                   session=session, grid=grid)
+        return 0
+
+    ag.launch_many = fake_many
+    rc, o = runcmd(["team", "@pair"])
+    check("@pair 开 a1 a2", cap.get("ids") == ["a1", "a2"], str(cap))
+    check("@pair 默认宫格、不续聊",
+          cap.get("layout") == "grid" and cap.get("resume") is False
+          and cap.get("grid") is None, str(cap))
+    rc, o = runcmd(["team", "pair"])
+    check("不带 @ 的组合名也认", cap.get("ids") == ["a1", "a2"], str(cap))
+    rc, o = runcmd(["team", "@win"])
+    check("@win 用一人一窗口", cap.get("layout") == "windows", str(cap))
+    check("@win 继承续聊", cap.get("resume") is True, str(cap))
+    check("@win 继承会话名", cap.get("session") == "zz", str(cap))
+    rc, o = runcmd(["team", "--new", "@win"])
+    check("--new 覆盖组合的续聊", cap.get("resume") is False, str(cap))
+    rc, o = runcmd(["team", "@gr"])
+    check("@gr 用保存的 3×1", cap.get("grid") == (3, 1), str(cap))
+    rc, o = runcmd(["team", "--windows", "@gr"])
+    check("命令行 --windows 覆盖组合布局",
+          cap.get("layout") == "windows", str(cap))
+    rc, o = runcmd(["team", "@gr", "--dry-run"])
+    check("@组合名也能 --dry-run", rc == 0 and "3×1 宫格" in o, o[:200])
+    rc, o = runcmd(["team", "--grid", "2x1", "@pair"])
+    check("组合也能被 --grid 覆盖", cap.get("grid") == (2, 1), str(cap))
+
+    rc, o, e = runcmd_err(["team", "@nope"])
+    check("不存在的组合明确报错", rc != 0 and "ag teams" in e, (o + e)[:200])
+    rc, o, e = runcmd_err(["team", "@bad"])
+    check("组合里有没登记的 agent 会拦住",
+          rc != 0 and "ghost" in e, (o + e)[:200])
+    rc, o, e = runcmd_err(["team", "@pair", "a3"])
+    check("组合后面不能再跟 agent", rc != 0, (o + e)[:200])
+
+    say("  · ag teams 列出")
+    rc, o = runcmd(["teams"])
+    check("ag teams 列出组合", rc == 0 and "@pair" in o and "@win" in o, o[:300])
+    check("列出布局与续聊标记", "一人一窗口" in o and "↻续聊" in o, o[:300])
+    check("缺成员的组合有提示", "ghost" in o, o[:300])
+    rc, o = runcmd(["teams", "--json"])
+    data_teams = json.loads(o)
+    check("ag teams --json 合法",
+          isinstance(data_teams, list) and len(data_teams) == 4, o[:120])
+    check("json 里有 missing 字段",
+          any(x["missing"] == ["ghost"] for x in data_teams), o[:220])
+
+    say("  · --save / --rm")
+    rc, o = runcmd(["team", "--save", "saved", "a1", "a3",
+                    "--windows", "-r", "--desc", "存下来"])
+    check("--save 成功", rc == 0 and "@saved" in o, o[:200])
+    tsaved = ag.find_team(ag.load_teams(), "saved")
+    check("保存的组合读得回来", bool(tsaved),
+          str([t.id for t in ag.load_teams()]))
+    check("保存了布局 / 续聊 / 说明",
+          tsaved.layout == "windows" and tsaved.resume is True
+          and tsaved.desc == "存下来", str(tsaved and tsaved.raw))
+    rc, o = runcmd(["team", "@saved"])
+    check("保存后立刻能按名字开", cap.get("ids") == ["a1", "a3"], str(cap))
+    rc, o, e = runcmd_err(["team", "--save", "saved", "a1", "a2"])
+    check("重名保存会报错", rc != 0 and "已存在" in e, (o + e)[:200])
+    rc, o, e = runcmd_err(["team", "--save", "bad2", "a1", "ghost"])
+    check("保存不存在的 agent 会报错", rc != 0 and "ghost" in e, (o + e)[:200])
+    rc, o, e = runcmd_err(["team", "--save", "nest", "pair"])
+    check("组合不能当另一个组合的成员", rc != 0 and "嵌套" in e, (o + e)[:200])
+    rc, o, e = runcmd_err(["team", "--save", "lonely"])
+    check("一个成员都没有会报错", rc != 0, (o + e)[:200])
+
+    rc, o = runcmd(["team", "--rm", "saved"])
+    check("--rm 成功", rc == 0 and "@saved" in o, o[:200])
+    check("删完就没了", ag.find_team(ag.load_teams(), "saved") is None)
+    check("删组合不动 agent 块",
+          [e.id for e in ag.load_registry()] == ["a1", "a2", "a3"],
+          str([e.id for e in ag.load_registry()]))
+    rc, o, e = runcmd_err(["team", "--rm", "saved"])
+    check("删不存在的组合明确报错", rc != 0 and "ag teams" in e, (o + e)[:200])
+
+    say("  · agent 块和组合块不能互相误伤")
+    rc, o, e = runcmd_err(["rm", "pair"])
+    check("ag rm 组合名时提示用 ag team --rm",
+          rc != 0 and "ag team --rm" in e, (o + e)[:200])
+    rc, o = runcmd(["rm", "a3"])
+    check("ag rm 删 agent 不吞掉后面的组合",
+          [x.id for x in ag.load_registry()] == ["a1", "a2"]
+          and [t.id for t in ag.load_teams()] == ["pair", "win", "gr", "bad"],
+          f"agents={[x.id for x in ag.load_registry()]} "
+          f"teams={[t.id for t in ag.load_teams()]}")
+finally:
+    ag.launch_many = _real_launch_many
+    ag.REGISTRY = saved_reg
+    shutil.rmtree(TEAM_DIR, ignore_errors=True)
+
+say()
 say("=" * 64)
 if fail:
     say(f"❌ {len(fail)} 项失败： {fail}")

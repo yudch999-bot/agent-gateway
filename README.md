@@ -15,7 +15,7 @@ Put them all behind one fuzzy picker, and add your own by editing one line.
 | 层 | 命令 | 解决什么 |
 |---|---|---|
 | **开哪个** | `ag` / `ag cc` | 十几套启动方式记不住 |
-| **同时开几个** | `ag` 里 Tab 多选 / `ag team` | 一个不够用，还得手动开窗口 |
+| **同时开几个** | `ag` 里 Tab 多选 / `ag team` / `ag team @组合名` | 一个不够用，还得手动开窗口 |
 | **接着哪个干** | `ag last` / `ag resume` / `Ctrl-R` | 每次都要重新交代上下文 |
 | **翻旧账 / 搬家** | `ag search` / `ag handoff` | 1.8G 会话历史躺着睡觉 |
 | 顺带 | `ag outdated` / `ag update` / `ag stats` / `ag pin` | 批量运维、看习惯 |
@@ -98,6 +98,10 @@ cd agent-gateway
 | **`ag resume [id]`** | **续聊。不带 id 会列出支持续聊的** |
 | **`ag team`** | **多选，一次全开，各占一个 tmux 窗口** |
 | `ag team cc oc goose` | 直接点名几个 |
+| **`ag team @组合名`** | **按保存好的组合开（成员、布局、续聊都记住）** |
+| **`ag teams`** | **列出保存的多开组合** |
+| `ag team --save 名 cc oc` | 把这次组合存下来 |
+| `ag team --rm 名` | 删掉组合 |
 | `ag team --grid 3x2 …` | 指定宫格形状（默认自动） |
 | `ag team --windows …` | 不开宫格，一人一个 tmux 窗口 |
 | `ag attach` | 回到之前的 tmux 会话 |
@@ -217,6 +221,51 @@ ag team --panes cc oc   # 用分屏，同屏都能看见
   ────────────────────────────────────────────────────────
   ↑↓ 移动 · Enter 一次全开（各占一个窗口） · ...
 ```
+
+### 存成组合，下次一条命令
+
+常用的那几个，每次都手敲太烦。存成名字，下次直接 `@`：
+
+```bash
+ag team --save review cc codex    # 存一个叫 review 的组合
+ag team @review                   # 一条命令，按保存的成员和布局全开
+
+ag teams                          # 看存了哪些
+ag team --rm review               # 删掉
+```
+
+存的时候可以带上布局、续聊和说明：
+
+```bash
+ag team --save pair cc oc --windows -r --desc "一个写、一个查"
+ag team --save trio cc codex gemini --grid 3x1
+```
+
+`ag teams` 列出每个组合的成员、布局，并标出没登记或还没装的 agent：
+
+```
+  多开组合  2 个 · 用 ag team @名字 一次全开
+
+  @review 互相审查          cc、codex  自动宫格
+           一个写、一个查，同屏两份视角
+  @trio   三方会审          cc、codex、gemini  3×1 宫格
+```
+
+组合就是注册表里的 `[[team]]` 块，手改也一样生效；没人手改时，
+`--save` / `--rm` 会连注释一起保留，改前自动备份：
+
+```toml
+[[team]]
+id = "review"
+name = "互相审查"
+agents = ["cc", "codex"]     # 成员短名
+layout = "grid"              # grid（默认）/ windows
+grid = "2x1"                 # 可选，不填自动算
+resume = true                # 打开时都续聊
+```
+
+命令行里给的参数会覆盖组合里的设置 —— `ag team --windows @review`
+就是「用 review 的成员，但这次一人一个窗口」。
 
 ### 宫格（默认）
 
