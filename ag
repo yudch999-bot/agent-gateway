@@ -54,7 +54,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -139,6 +139,43 @@ class Entry:
         return None
 
 
+class Team:
+    """一个保存好的多开组合：`ag team @名字` 一次全开。
+
+    注册表里的 [[team]] 块，字段都是可选的，只有 id 和 agents 必填。
+    """
+
+    __slots__ = ("id", "name", "desc", "agents", "layout", "grid",
+                 "resume", "session", "raw")
+
+    def __init__(self, d: dict):
+        self.raw = d
+        self.id = str(d.get("id", "")).strip()
+        self.name = str(d.get("name", self.id)).strip()
+        self.desc = str(d.get("desc", "")).strip()
+        raw = d.get("agents", [])
+        if isinstance(raw, str):          # agents = "cc" 也当一个人，别拆成两个字符
+            raw = [raw]
+        elif not isinstance(raw, (list, tuple)):
+            raw = []
+        self.agents = [str(a).strip() for a in raw if str(a).strip()]
+        # 布局：grid（默认，切宫格）/ windows（一人一个窗口）。
+        # 认不出的写法一律当默认，别让注册表里一个笔误就把命令搞挂。
+        layout = str(d.get("layout", "")).strip().lower()
+        self.layout = layout if layout in ("grid", "windows") else "grid"
+        self.grid = parse_grid(str(d.get("grid", "")))
+        self.resume = bool(d.get("resume", False))
+        self.session = str(d.get("session", "")).strip()
+
+    @property
+    def ref(self):
+        """用户在命令行里敲的那个名字：@review。"""
+        return "@" + self.id
+
+    def grid_spec(self):
+        return f"{self.grid[0]}x{self.grid[1]}" if self.grid else ""
+
+
 def load_registry(path=None):
     # 注意别写成 path=REGISTRY：默认参数在「函数定义时」就绑定死了，
     # 之后改 ag.REGISTRY（比如测试里指向临时文件）它不会跟。
@@ -161,6 +198,32 @@ def find_entry(entries, key):
     for e in entries:
         if any(a.lower() == k for a in e.all_ids):
             return e
+    return None
+
+
+def load_teams(path=None):
+    """读注册表里的 [[team]] 块。坏块/空块直接跳过。"""
+    path = path or REGISTRY
+    if not os.path.exists(path):
+        return []
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    out = []
+    for d in data.get("team", []):
+        t = Team(d)
+        if t.id and t.agents:
+            out.append(t)
+    return out
+
+
+def find_team(teams, key):
+    """精确匹配组合名，带不带 @ 都认。"""
+    k = (key or "").lstrip("@").lower()
+    if not k:
+        return None
+    for t in teams:
+        if t.id.lower() == k:
+            return t
     return None
 
 
@@ -757,51 +820,154 @@ def launch_many(entries, layout="grid", resume=False, session=None, grid=None):
 def cmd_team(entries, args):
     """一次开多个 agent。
 
-        ag team                  多选器（Tab 勾选），默认切宫格
-        ag team cc oc goose      直接点名
-        ag team --grid 3x3 ...   指定几列几行
-        ag team --cols 3 ...     只指定列数，行数自己算
-        ag team --windows ...    不开宫格，一人一个 tmux 窗口
-        ag team -r cc oc         都续聊上次的会话
+        ag team                   多选器（Tab 勾选），默认切宫格
+        ag team cc oc goose       直接点名
+        ag team @review           按保存好的组合开（ag teams 看有哪些）
+        ag team --grid 3x3 ...    指定几列几行
+        ag team --cols 3 ...      只指定列数，行数自己算
+        ag team --windows ...     不开宫格，一人一个 tmux 窗口
+        ag team -r cc oc          都续聊上次的会话
+        ag team --save review cc oc   把组合存下来
+        ag team --rm review       删掉组合
+        ag team --list            列出所有组合
     """
     # --panes 是老的写法，现在宫格就是默认，留着免得旧习惯敲了报错
-    layout = "windows" if ("--windows" in args or "-w" in args) else "grid"
-    resume = "-r" in args or "--resume" in args
+    layout = None
+    resume = None            # None = 没表态，用组合里的设置；False = --new 强制新会话
     session = None
     grid = None
     cols = None
-    for i, a in enumerate(args):
-        if a.startswith("--session="):
+    save_name = None
+    rm_name = None
+    display, desc = None, None
+    dry = False
+    ids = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+
+        def val(default=None):
+            return args[i + 1] if i + 1 < len(args) else default
+
+        if a in ("--list", "-l"):
+            return cmd_teams(entries, [])
+        if a == "--save":
+            save_name = val()
+            if not save_name:
+                return die("用法：ag team --save <名字> <id> [id...]")
+            i += 2
+            continue
+        if a.startswith("--save="):
+            save_name = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a in ("--rm", "--remove", "--delete"):
+            rm_name = val()
+            if not rm_name:
+                return die("用法：ag team --rm <名字>")
+            i += 2
+            continue
+        if a.startswith("--rm="):
+            rm_name = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a in ("--windows", "-w"):
+            layout = "windows"
+        elif a in ("--panes",):
+            layout = "grid"
+        elif a in ("-r", "--resume"):
+            resume = True
+        elif a in ("--new", "--no-resume"):
+            resume = False
+        elif a in ("-s", "--session"):
+            session = val()
+            i += 2
+            continue
+        elif a.startswith("--session="):
             session = a.split("=", 1)[1]
-        elif a in ("-s", "--session") and i + 1 < len(args):
-            session = args[i + 1]
+        elif a == "--grid":
+            grid = parse_grid(val(""))
+            if grid is None:
+                return die(f"宫格写法看不懂：{val('')}（例：3x2）")
+            i += 2
+            continue
         elif a.startswith("--grid="):
             grid = parse_grid(a.split("=", 1)[1])
-        elif a == "--grid" and i + 1 < len(args):
-            grid = parse_grid(args[i + 1])
+            if grid is None:
+                return die(f"宫格写法看不懂：{a.split('=', 1)[1]}（例：3x2）")
+        elif a == "--cols":
+            try:
+                cols = int(val(""))
+            except (TypeError, ValueError):
+                return die(f"列数得是正整数：{val('')}")
+            i += 2
+            continue
         elif a.startswith("--cols="):
             try:
                 cols = int(a.split("=", 1)[1])
             except ValueError:
-                pass
-        elif a == "--cols" and i + 1 < len(args):
-            try:
-                cols = int(args[i + 1])
-            except ValueError:
-                pass
+                return die(f"列数得是正整数：{a.split('=', 1)[1]}")
+        elif a == "--name":
+            display = val()
+            i += 2
+            continue
+        elif a == "--desc":
+            desc = val()
+            i += 2
+            continue
+        elif a in ("--dry-run", "-n"):
+            dry = True
+        elif a.startswith("-"):
+            pass                      # 不认识的选项忽略，保持老行为
+        else:
+            ids.append(a)
+        i += 1
 
-    def is_val(x, key):
-        """这个 token 是不是某个选项的值，别被当成 agent 名。"""
-        return x in (grid_spec, cols_spec, session)
+    if save_name:
+        if cols and not grid and ids:
+            grid = (cols, -(-len(ids) // cols))
+        return save_team(entries, save_name, ids, layout=layout or "grid",
+                         grid=grid, resume=bool(resume), session=session,
+                         display=display, desc=desc)
+    if rm_name:
+        return remove_team(rm_name)
 
-    grid_spec = next((args[j + 1] for j, x in enumerate(args)
-                      if x == "--grid" and j + 1 < len(args)), None)
-    cols_spec = next((args[j + 1] for j, x in enumerate(args)
-                      if x == "--cols" and j + 1 < len(args)), None)
-    ids = [a for a in args
-           if not a.startswith("-") and a not in (session, grid_spec, cols_spec)]
-
+    # 第一个位置参数是组合名（带 @ 一定当组合；不带 @ 时「不是 agent」才当组合）
+    from_team = None
     if ids:
+        teams = load_teams()
+        ref = ids[0]
+        if ref.startswith("@"):
+            from_team = find_team(teams, ref)
+            if not from_team:
+                return die(f"没有叫「{ref}」的组合。看有哪些：ag teams")
+        elif find_entry(entries, ref) is None:
+            from_team = find_team(teams, ref)
+        if from_team:
+            if len(ids) > 1:
+                return die("组合后面不能再跟 agent，需要临时改动就各自点名")
+            ids = []
+
+    if from_team:
+        # 组合给默认值，命令行显式给的覆盖它
+        if layout is None:
+            layout = from_team.layout
+        if grid is None:
+            grid = from_team.grid
+        if resume is None:
+            resume = from_team.resume
+        if session is None and from_team.session:
+            session = from_team.session
+
+        missing = [a for a in from_team.agents if not find_entry(entries, a)]
+        if missing:
+            return die(f"组合「{from_team.ref}」里这些 agent 不在注册表："
+                       + "、".join(missing))
+        picked = [find_entry(entries, a) for a in from_team.agents]
+        print(f"  {C['gry']}组合 {C['b']}{from_team.ref}{C['r']}"
+              f"{C['gry']}{('（' + from_team.name + '）') if from_team.name != from_team.id else ''}"
+              f" → {', '.join(e.id for e in picked)}{C['r']}")
+    elif ids:
         picked = []
         for a in ids:
             e = find_entry(entries, a)
@@ -816,10 +982,13 @@ def cmd_team(entries, args):
             print(f"  {C['gry']}没选，退出{C['r']}")
             return 0
 
+    layout = layout or "grid"
+    resume = bool(resume)
+
     if cols and not grid:
         grid = (cols, -(-len(picked) // cols))
 
-    if "--dry-run" in args or "-n" in args:
+    if dry:
         sess = session or "ag"
         plan = build_tmux_plan(picked, sess, layout, resume, fresh=True, grid=grid)
         shape = ("一人一个窗口" if layout == "windows"
@@ -851,6 +1020,168 @@ def cmd_team(entries, args):
         return cmd_launch(picked[0], [], resume=resume)
     return launch_many(picked, layout=layout, resume=resume,
                        session=session, grid=grid)
+
+
+def cmd_teams(entries, args):
+    """列出保存好的多开组合。"""
+    teams = load_teams()
+
+    if "--json" in args:
+        rows = []
+        for t in teams:
+            rows.append({
+                "id": t.id, "name": t.name, "desc": t.desc,
+                "agents": t.agents, "layout": t.layout,
+                "grid": t.grid_spec(), "resume": t.resume,
+                "session": t.session,
+                "missing": [a for a in t.agents if not find_entry(entries, a)],
+                "not_installed": [a for a in t.agents
+                                  if (find_entry(entries, a) is not None
+                                      and not find_entry(entries, a).resolved())],
+            })
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+
+    if not teams:
+        print(f"\n  {C['gry']}还没有保存的组合。存一个：{C['cyn']}"
+              f"ag team --save review cc oc{C['r']}\n")
+        return 0
+
+    print(f"\n  {C['b']}多开组合{C['r']}  {C['gry']}{len(teams)} 个 · "
+          f"用 ag team @名字 一次全开{C['r']}\n")
+    idw = max([vis_len(t.ref) for t in teams] + [6])
+    for t in teams:
+        missing = [a for a in t.agents if not find_entry(entries, a)]
+        notinst = [a for a in t.agents
+                   if find_entry(entries, a) is not None
+                   and not find_entry(entries, a).resolved()]
+        members = "、".join(
+            (f"{C['red']}{a}{C['r']}" if a in missing
+             else f"{C['yel']}{a}{C['r']}" if a in notinst
+             else a) for a in t.agents)
+        if t.layout == "windows":
+            what = "一人一窗口"
+        elif t.grid:
+            what = f"{t.grid[0]}×{t.grid[1]} 宫格"
+        else:
+            what = "自动宫格"
+        flags = f"  {C['mag']}↻续聊{C['r']}" if t.resume else ""
+        print(f"  {C['b']}{pad(t.ref, idw)}{C['r']} "
+              f"{C['gry']}{pad(trunc(t.name, 16), 18)}{C['r']}"
+              f"{members}  {C['gry']}{what}{C['r']}{flags}")
+        if t.desc:
+            print(f"  {' ' * idw}  {C['dim']}{t.desc}{C['r']}")
+        if missing:
+            print(f"  {' ' * idw}  {C['red']}这几个不在注册表里："
+                  f"{'、'.join(missing)}{C['r']}")
+        elif notinst:
+            print(f"  {' ' * idw}  {C['yel']}这几个还没装："
+                  f"{'、'.join(notinst)}{C['r']}")
+
+    print(f"\n  {C['gry']}保存：{C['cyn']}ag team --save 名字 cc oc{C['r']}"
+          f"{C['gry']}　删除：{C['cyn']}ag team --rm 名字{C['r']}\n")
+    return 0
+
+
+def save_team(entries, team_id, member_ids, layout="grid", grid=None,
+              resume=False, session=None, display=None, desc=None):
+    """把一次多开存成 [[team]] 块，以后 ag team @名字 就能打开。"""
+    team_id = (team_id or "").lstrip("@").strip()
+    if not team_id:
+        return die("组合名字不能为空")
+    if not member_ids:
+        return die(f"组合「@{team_id}」至少要有一个 agent："
+                   f"ag team --save {team_id} cc oc")
+    if find_team(load_teams(), team_id):
+        return die(f"组合「@{team_id}」已存在，先 ag team --rm {team_id}")
+
+    resolved, missing = [], []
+    for m in member_ids:
+        e = find_entry(entries, m)
+        if e:
+            resolved.append(e.id)     # 存规范短名，以后改别名也不受影响
+        else:
+            missing.append(m)
+    if missing:
+        team_hits = [m for m in missing if find_team(load_teams(), m)]
+        if team_hits:
+            return die("组合不能嵌套进另一个组合："
+                       + "、".join("「%s」" % t for t in team_hits))
+        return die("注册表里没有：" + "、".join("「%s」" % m for m in missing))
+
+    t = Team(dict(id=team_id, name=(display or team_id), desc=(desc or ""),
+                  agents=resolved, layout=layout, resume=resume,
+                  session=(session or ""),
+                  grid=(f"{grid[0]}x{grid[1]}" if grid else "")))
+    bk = backup_registry()
+    with open(REGISTRY, "a", encoding="utf-8") as f:
+        f.write("\n# ── 由 `ag team --save` 添加 ──\n" + render_team_toml(t))
+
+    print(f"  {C['grn']}✓ 已保存组合{C['r']} {C['b']}{t.ref}{C['r']} → "
+          f"{', '.join(resolved)}")
+    print(f"  {C['gry']}打开：{C['cyn']}ag team {t.ref}{C['r']}"
+          f"{C['gry']}　备份：{bk}{C['r']}\n")
+    return 0
+
+
+def remove_team(team_id):
+    """按 [[team]] 块整块删除，保留文件里的注释和 agent 块。"""
+    team_id = (team_id or "").lstrip("@").strip()
+    if not team_id:
+        return die("用法：ag team --rm <名字>")
+
+    with open(REGISTRY, encoding="utf-8") as f:
+        lines = f.readlines()
+
+    out, block, dropped = [], [], []
+    want = team_id.lower()
+
+    def flush():
+        if not block:
+            return
+        # 块尾的注释/空行多半是下一节的小标题，摘出来别跟着删
+        tail = []
+        while len(block) > 1 and (not block[-1].strip()
+                                  or block[-1].lstrip().startswith("#")):
+            tail.insert(0, block.pop())
+        hit = None
+        for ln in block:
+            s = ln.strip()
+            if s.startswith("id") and "=" in s:
+                v = s.split("=", 1)[1].strip().strip("\"'")
+                if v.lower() == want:
+                    hit = v
+        if hit:
+            dropped.append(hit)
+        else:
+            out.extend(block)
+        out.extend(tail)
+
+    for ln in lines:
+        ls = ln.lstrip()
+        if ls.startswith("[[team]]"):
+            flush()
+            block = [ln]
+        elif block and ls.startswith("[["):
+            flush()
+            block = []
+            out.append(ln)
+        elif block:
+            block.append(ln)
+        else:
+            out.append(ln)
+    flush()
+
+    if not dropped:
+        return die(f"没有叫「{team_id}」的组合。看有哪些：ag teams")
+
+    bk = backup_registry()
+    with open(REGISTRY, "w", encoding="utf-8") as f:
+        f.writelines(out)
+    print(f"  {C['grn']}✓ 已删除组合{C['r']} {C['b']}@{dropped[0]}{C['r']}"
+          f"  {C['gry']}(agent 块和注释都没动){C['r']}")
+    print(f"  {C['gry']}备份：{bk}{C['r']}\n")
+    return 0
 
 
 def cmd_attach(entries, args):
@@ -2509,6 +2840,24 @@ def render_toml(e: Entry):
     return "\n".join(L) + "\n"
 
 
+def render_team_toml(t: Team):
+    L = ["[[team]]", f"id = {toml_str(t.id)}"]
+    if t.name and t.name != t.id:
+        L.append(f"name = {toml_str(t.name)}")
+    if t.desc:
+        L.append(f"desc = {toml_str(t.desc)}")
+    L.append(f"agents = {toml_arr(t.agents)}")
+    if t.layout and t.layout != "grid":
+        L.append(f"layout = {toml_str(t.layout)}")
+    if t.grid:
+        L.append(f"grid = {toml_str(t.grid_spec())}")
+    if t.resume:
+        L.append("resume = true")
+    if t.session:
+        L.append(f"session = {toml_str(t.session)}")
+    return "\n".join(L) + "\n"
+
+
 def backup_registry():
     """改注册表前先备份一份。"""
     import time
@@ -2543,7 +2892,13 @@ def cmd_rm(entries, args):
         elif e.id not in [t.id for t in targets]:
             targets.append(e)
     if missing:
-        return die("注册表里没有：" + "、".join("「%s」" % m for m in missing))
+        team_hits = [m for m in missing if find_team(load_teams(), m)]
+        hint = ""
+        if team_hits:
+            hint = (f"（{ '、'.join('@' + t for t in team_hits) } 是多开组合，"
+                    f"用 ag team --rm 删）")
+        return die("注册表里没有：" + "、".join("「%s」" % m for m in missing)
+                   + hint)
 
     names = set()
     for t in targets:
@@ -2580,9 +2935,15 @@ def cmd_rm(entries, args):
         out.extend(tail)
 
     for ln in lines:
-        if ln.lstrip().startswith("[[agent]]"):
+        ls = ln.lstrip()
+        if ls.startswith("[[agent]]"):
             flush()
             block = [ln]
+        elif block and ls.startswith("[["):
+            # 撞上别的区块（比如 [[team]]）就收尾 —— 不然会把它一起吞掉
+            flush()
+            block = []
+            out.append(ln)
         elif block:
             block.append(ln)
         else:
@@ -2696,9 +3057,13 @@ def usage():
   {C['b']}一次开多个（tmux 窗口/分屏）{C['r']}
     ag team               打开多选器，勾几个就开几个
     ag team cc oc goose   直接指定几个
+    ag team @组合名        按保存好的组合开（ag teams 看有哪些）
     ag team --grid 3x2 cc oc goose  指定几列几行
     ag team --windows cc oc         不开宫格，一人一个窗口
     ag team -r cc oc      都续聊上次的会话
+    ag team --save 名 cc oc  把这次组合存下来，下次 ag team @名
+    ag team --rm 名       删掉组合
+    ag teams              列出保存的多开组合
     ag attach             回到之前的 tmux 会话
     ag ps                 看现在有哪些 agent 在跑
     ag kill [id...]       关掉指定的窗口（不带参数会列出让你挑）
@@ -2774,7 +3139,8 @@ def main(argv):
            "outdated": cmd_outdated, "old": cmd_outdated,
            "search": cmd_search, "find": cmd_search, "s": cmd_search,
            "handoff": cmd_handoff, "ho": cmd_handoff,
-           "team": cmd_team, "multi": cmd_team, "attach": cmd_attach,
+           "team": cmd_team, "teams": cmd_teams, "multi": cmd_team,
+           "attach": cmd_attach,
            "ps": cmd_ps, "kill": cmd_kill, "stop": cmd_kill}
 
     if a and a[0] in sub:

@@ -336,3 +336,36 @@ tags = ["codewhale"]
 alias = ["codewhale"]
 resume = ["resume"]
 install = "curl -fsSL https://codewhale.net/install.sh | sh"
+
+# ============================================================
+#  多开组合 —— 把常用的「同时开哪几个」存成一个名字
+#
+#  用：    ag team @review          （看有哪些：ag teams）
+#  存：    ag team --save 名字 cc oc [--windows] [--grid 3x1] [-r]
+#  删：    ag team --rm 名字
+#
+#  [[team]] 字段：
+#    id       必填，组合名，`ag team @<id>` 敲的那个
+#    agents   必填，成员短名列表
+#    name     显示名（不填就用 id）
+#    desc     一句话说明
+#    layout   "grid"（默认，切宫格）/ "windows"（一人一个窗口）
+#    grid     宫格形状，如 "3x2"（不填自动算）
+#    resume   true = 打开时都续聊上次的会话
+#    session  指定 tmux 会话名（不填沿用默认的 ag）
+# ============================================================
+
+# ---------- 一个写、一个查 ----------
+[[team]]
+id = "review"
+name = "互相审查"
+desc = "一个写、一个查，同屏两份视角"
+agents = ["cc", "codex"]
+
+# ---------- 三方会审 ----------
+[[team]]
+id = "trio"
+name = "三方会审"
+desc = "三个模型同时上，各占一格"
+agents = ["cc", "codex", "gemini"]
+grid = "3x1"

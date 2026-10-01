@@ -9,23 +9,46 @@
 #  不想要快捷键就设  AG_NO_KEYBIND=1
 # ============================================================
 
-# 从注册表里抽 id 和 alias（纯 grep/sed，Tab 时无延迟）
-_ag_ids() {
-  local reg="${AG_REGISTRY:-$HOME/.agents/registry.toml}"
+# 从注册表里按区块抽 id 和 alias（纯 awk/sed，Tab 时无延迟）。
+# 分区块是为了不让 [[team]] 的组合名混进 agent 短名里。
+_ag_section_ids() {
+  local reg="${AG_REGISTRY:-$HOME/.agents/registry.toml}" want="$1"
   [[ -r $reg ]] || return
-  grep -hE '^[[:space:]]*(id|alias)[[:space:]]*=' "$reg" 2>/dev/null \
+  awk -v want="$want" '
+    /^[[:space:]]*\[\[agent\]\]/ { sec = "agent"; next }
+    /^[[:space:]]*\[\[team\]\]/  { sec = "team";  next }
+    /^[[:space:]]*\[\[/          { sec = "" }
+    sec == want && /^[[:space:]]*(id|alias)[[:space:]]*=/ { print }
+  ' "$reg" 2>/dev/null \
     | sed -E 's/.*=[[:space:]]*//; s/^\[//; s/\][[:space:]]*$//; s/["'"'"']//g; s/,[[:space:]]*/ /g' \
     | tr ' ' '\n' | grep -v '^$'
 }
 
+# 从注册表里抽 agent 的 id 和 alias
+_ag_ids() {
+  _ag_section_ids agent
+}
+
+_ag_team_ids() {
+  _ag_section_ids team
+}
+
 _ag() {
-  local -a ids
+  local -a ids teams trefs
   ids=(${(f)"$(_ag_ids)"})
+  teams=(${(f)"$(_ag_team_ids)"})
+  local t
+  for t in $teams; do trefs+=("@$t"); done
   if (( CURRENT == 2 )); then
-    compadd -X '子命令' -- ls add rm edit scan doctor install which path help
+    compadd -X '子命令' -- ls add rm edit scan doctor install which path teams team help
     (( ${#ids} )) && compadd -X 'agent（也可直接敲关键词再 Tab）' -- $ids
   else
     case ${words[2]} in
+      team)
+        if (( CURRENT == 3 )); then
+          (( ${#trefs} )) && compadd -X '组合（@名字）' -- $trefs
+          (( ${#ids} )) && compadd -X 'agent' -- $ids
+        fi ;;
       rm|which|install) (( ${#ids} )) && compadd -X 'agent' -- $ids ;;
       edit|ls|scan|doctor|path) _files ;;
       *) _files ;;
