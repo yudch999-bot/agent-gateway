@@ -971,7 +971,7 @@ say("  · 选择器：@ 过滤")
 out, got, _ = run([b"@", b"h", b"e", b"r", ESC])
 txt = last_frame(out)
 check("@her 只剩 Hermes 组", "Hermes" in txt and "原厂 CLI" not in txt, txt[:300])
-check("@ 过滤时计数正确", "3/29" in txt, txt[:200])
+check("@ 过滤时计数正确", "3/32" in txt, txt[:200])
 out, got, _ = run([b"@", b"n", b"o", b"s", b"u", b"c", b"h", ESC])
 check("不存在的组给空态而不是崩", "没有匹配" in strip(out), strip(out)[:300])
 
