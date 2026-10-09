@@ -114,7 +114,7 @@ cd agent-gateway
 空筛选时**按组显示**，一打字就切回平铺：
 
 ```
-  ag Agent Gateway  29/29 · 选一个 agent · 输入即筛选
+  ag Agent Gateway  32/32 · 选一个 agent · 输入即筛选
   ❯
   ────────────────────────────────────────────────────────────
   原厂 CLI ───────────────────────────────────────────────────
@@ -383,7 +383,7 @@ resume = ["resume"]       # 子命令式，如 codex / omx
 resume = ["session", "--resume"]   # 更长的，如 goose
 ```
 
-示例注册表里 **29 条有 15 条**已经填好了（都实测过 `--help`，不是猜的）。
+示例注册表里 **32 条有 17 条**已经填好了（都实测过 `--help`，不是猜的）。
 没填的按 `Ctrl-R` 会明确提示你去加，而不是默默开个新会话。
 
 `ag stats` 能看你到底在用哪些：
@@ -411,7 +411,7 @@ ag search 登录页           # 我记得上周让某个 agent 改过，但忘�
 ```
 
 ```
-  搜索 4 个 agent 的历史会话：'公众号'
+  搜索 6 个 agent 的历史会话：'公众号'
     cc           40 /51 个会话命中
     codex        77 /84 个会话命中
     j            32 /91 个会话命中
@@ -423,7 +423,7 @@ ag search 登录页           # 我记得上周让某个 agent 改过，但忘�
             ~/.claude/projects/-Users-yudengcheng/23451c59-….jsonl
 ```
 
-`ag search` 走 ripgrep，扫完 4 个 agent 约 **1.8 秒**。找到之后 `ag resume <id>`
+`ag search` 走 ripgrep，扫完 6 个 agent 约 **1.8 秒**。找到之后 `ag resume <id>`
 就能接着聊。
 
 ### 交接

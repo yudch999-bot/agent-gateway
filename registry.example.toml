@@ -325,7 +325,42 @@ tags = ["minimax"]
 resume = ["--session"]
 install = "curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash"
 
-# ---------- 18. CodeWhale ----------
+# ---------- 18. Cline ----------
+[[agent]]
+id = "cline"
+name = "Cline"
+cmd = "cline"
+group = "原厂 CLI"
+args = ["--tui"]
+sessions = "~/.cline/data/sessions"
+desc = "Cline 官方终端 agent"
+tags = ["cline"]
+install = "npm i -g cline"
+
+# ---------- 19. AtomCode ----------
+[[agent]]
+id = "atomcode"
+name = "AtomCode"
+cmd = "atomcode"
+group = "原厂 CLI"
+sessions = "~/.atomcode/sessions"
+desc = "AtomGit 开源 Rust 编码 agent（Claude Code 平替）"
+tags = ["atomgit", "opensource", "rust"]
+resume = ["resume"]
+install = "curl -fsSL https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts/install.sh | sh"
+
+# ---------- 20. GitHub Copilot CLI ----------
+[[agent]]
+id = "copilot"
+name = "GitHub Copilot CLI"
+cmd = "copilot"
+group = "原厂 CLI"
+desc = "GitHub 官方 Copilot CLI"
+tags = ["github", "copilot"]
+resume = ["--resume"]
+install = "npm i -g @github/copilot"
+
+# ---------- 21. CodeWhale ----------
 [[agent]]
 id = "cw"
 name = "CodeWhale"
