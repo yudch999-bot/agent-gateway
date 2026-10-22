@@ -955,6 +955,63 @@ cmd = "echo"
           rc == 0 and "跳过" in e, repr(e))
     check("stdout 里只有 prompt 本身", "跳过" not in o, o[:120])
     check("拿到的是有对话的那个", "登录页" in o, o[:300])
+
+    say("  · ag history")
+    rc, o = runcmd(["history", "--json", "--limit=0"])
+    hrows = json.loads(o)
+    check("history --json 输出会话列表", rc == 0 and isinstance(hrows, list),
+          o[:300])
+    agents = {r["agent"] for r in hrows}
+    check("history 跨 agent 汇总", {"cc", "codex", "j"} <= agents, str(agents))
+    cc_row = next(r for r in hrows if r["agent"] == "cc" and r.get("title"))
+    check("history 带 cwd / 标题 / 路径",
+          cc_row["cwd"] == "/Users/me/proj-a" and "登录页" in cc_row["title"]
+          and cc_row["path"].endswith("s1.jsonl"), str(cc_row))
+    check("history 写了索引缓存", os.path.exists(ag.history_cache_path()),
+          ag.history_cache_path())
+
+    rc, o = runcmd(["history", "codex", "--json"])
+    hrows2 = json.loads(o)
+    check("history 可以只看某个 agent",
+          hrows2 and all(r["agent"] == "codex" for r in hrows2), o[:300])
+    rc, o = runcmd(["history", "--cwd=proj-b", "--json"])
+    hrows3 = json.loads(o)
+    check("history 可以按 cwd 过滤",
+          hrows3 and all("proj-b" in (r.get("cwd") or "") for r in hrows3), o[:300])
+
+    rc, o = runcmd(["handoff", "cc", "--session", cc_row["path"], "--print"])
+    check("handoff 可以精确指定会话",
+          rc == 0 and "登录页" in o and "跳过" not in o, o[:300])
+    rc, o, e = runcmd_err(["handoff", "cc", "--session", "/etc/passwd", "--print"])
+    check("handoff 拒绝 sessions 目录外的文件",
+          rc != 0 and "sessions 目录" in e, (o + e)[:300])
+
+    out, got, _ = run([ENTER], argv=["ag", "history", "--limit=0"])
+    check("history 回车选择最近会话续聊",
+          got.get("launched", ("",))[0] == "cc" and got.get("resume") is True,
+          str(got))
+    out, got, _ = run([b"c", b"o", b"d", b"e", b"x", ENTER],
+                      argv=["ag", "history", "--limit=0"])
+    check("history 输入筛选用 Enter 选中目标 agent",
+          got.get("launched", ("",))[0] == "codex", str(got))
+
+    real_handoff = ag.cmd_handoff
+    handoff_call = {}
+    def fake_handoff(entries_arg, args_arg):
+        handoff_call["entries"] = entries_arg
+        handoff_call["args"] = args_arg
+        return 0
+    ag.cmd_handoff = fake_handoff
+    try:
+        out, got, _ = run([b"\x0f"], argv=["ag", "history", "--limit=0"])
+    finally:
+        ag.cmd_handoff = real_handoff
+    check("history Ctrl-O 把 entries 和精确会话传给 handoff",
+          handoff_call.get("entries") and
+          handoff_call.get("args", [])[:1] == ["cc"] and
+          "--session" in handoff_call.get("args", []) and
+          handoff_call["args"][-1].endswith("s9.jsonl"),
+          str(handoff_call))
 finally:
     ag.REGISTRY = saved_reg
     shutil.rmtree(SESS_DIR, ignore_errors=True)
