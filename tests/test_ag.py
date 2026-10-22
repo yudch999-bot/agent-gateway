@@ -623,6 +623,78 @@ finally:
     shutil.rmtree(REP_DIR, ignore_errors=True)
 
 say()
+say("15.6) doctor --json 与 install --missing 一致性")
+DOC_DIR = tempfile.mkdtemp(prefix="ag-doctor-")
+DOC_REG = os.path.join(DOC_DIR, "registry.toml")
+DOC_BIN = os.path.join(DOC_DIR, "repaired-agent")
+with open(DOC_REG, "w", encoding="utf-8") as fh:
+    fh.write(f'''
+[[agent]]
+id = "ok"
+name = "已安装"
+cmd = "echo"
+
+[[agent]]
+id = "fixable"
+name = "可修复"
+cmd = "{DOC_BIN}"
+install = "{install_script(DOC_BIN)}"
+
+[[agent]]
+id = "manual"
+name = "手工处理"
+cmd = "{os.path.join(DOC_DIR, "missing-agent")}"
+
+[[agent]]
+id = "hidden"
+name = "隐藏项"
+cmd = "{os.path.join(DOC_DIR, "hidden-agent")}"
+hidden = true
+''')
+
+saved_reg = ag.REGISTRY
+ag.REGISTRY = DOC_REG
+try:
+    rc, o = runcmd(["doctor", "--json"])
+    data = json.loads(o)
+    check("doctor --json 输出合法 JSON", rc == 0, o[:200])
+    check("schema/version/registry 字段齐全",
+          data.get("schema_version") == 1 and data.get("ag_version") == ag.VERSION
+          and data.get("registry") == DOC_REG, str(data)[:300])
+    check("summary 计数正确",
+          data["summary"] == {"total": 4, "available": 1, "missing": 3,
+                              "repairable": 1, "manual": 2},
+          str(data["summary"]))
+    by_id = {x["id"]: x for x in data["items"]}
+    check("已安装项 scope 是 system/home",
+          by_id["ok"]["available"] is True and by_id["ok"]["scope"] in ("home", "system"),
+          str(by_id["ok"]))
+    check("可修复项标记 install", by_id["fixable"]["repair"] == "install",
+          str(by_id["fixable"]))
+    check("缺安装命令项标记 manual", by_id["manual"]["repair"] == "manual",
+          str(by_id["manual"]))
+    check("隐藏项也保留在 JSON 里", by_id["hidden"]["hidden"] is True)
+    check("JSON 不混 ANSI 颜色", "\033" not in o)
+
+    rc, stdout, stderr = runcmd_err(["doctor", "--json", "--fix"])
+    check("doctor --json 与 --fix 明确拒绝",
+          rc != 0 and "--json" in stderr and "--fix" in stderr,
+          (stdout + stderr)[:300])
+
+    rc, o = runcmd(["install", "--missing", "--dry-run"])
+    check("install --missing 复用 repair 的 dry-run",
+          rc == 0 and "--dry-run" in o and not os.path.exists(DOC_BIN), o[:300])
+
+    rc, o = runcmd(["install", "--missing"])
+    check("install --missing 复用 repair 并执行安装",
+          rc == 1 and os.path.exists(DOC_BIN), o[-500:])
+    check("install --missing 仍汇报手工项",
+          "仍需手工处理 2 条" in o, o[-500:])
+finally:
+    ag.REGISTRY = saved_reg
+    shutil.rmtree(DOC_DIR, ignore_errors=True)
+
+say()
 say("16) 会话搜索与交接")
 SESS_DIR = tempfile.mkdtemp(prefix="ag-sess-")
 

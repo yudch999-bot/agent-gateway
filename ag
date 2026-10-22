@@ -55,7 +55,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -2999,9 +2999,65 @@ def cmd_scan(entries, args):
     return 0
 
 
+def doctor_report(entries):
+    """生成稳定的机器可读体检结果。"""
+    items = []
+    available = 0
+    repairable = 0
+    manual = 0
+    for e in entries:
+        path = e.resolved()
+        ok = path is not None
+        if ok:
+            available += 1
+            scope = "home" if os.path.realpath(path).startswith(HOME) else "system"
+            repair = None
+        else:
+            scope = "missing"
+            if e.install:
+                repairable += 1
+                repair = "install"
+            else:
+                manual += 1
+                repair = "manual"
+        items.append({
+            "id": e.id,
+            "name": e.name,
+            "cmd": e.cmd,
+            "available": ok,
+            "path": path,
+            "scope": scope,
+            "install": e.install or None,
+            "update": e.update or None,
+            "repair": repair,
+            "group": e.group,
+            "hidden": e.hidden,
+        })
+    return {
+        "schema_version": 1,
+        "ag_version": VERSION,
+        "registry": REGISTRY,
+        "summary": {
+            "total": len(entries),
+            "available": available,
+            "missing": len(entries) - available,
+            "repairable": repairable,
+            "manual": manual,
+        },
+        "items": items,
+    }
+
+
 def cmd_doctor(entries, args):
-    if "--fix" in args or "-f" in args:
+    as_json = "--json" in args
+    fix = "--fix" in args or "-f" in args
+    if fix and as_json:
+        return die("ag doctor --json 和 --fix 不能同时使用")
+    if fix:
         return cmd_repair(entries, [a for a in args if a not in ("--fix", "-f")])
+    if as_json:
+        print(json.dumps(doctor_report(entries), ensure_ascii=False, indent=2))
+        return 0
     print(f"\n  {C['b']}ag doctor{C['r']}  {C['gry']}注册表：{REGISTRY}{C['r']}\n")
     bad = 0
     for e in entries:
@@ -3138,14 +3194,8 @@ def cmd_install(entries, args):
     if not args:
         return die("用法：ag install <id> | ag install --missing")
     if args[0] == "--missing":
-        todo = [e for e in entries if not e.resolved() and e.install]
-        if not todo:
-            print(f"  {C['grn']}✓ 没有缺失的{C['r']}")
-            return 0
-        for e in todo:
-            print(f"\n  {C['b']}安装 {e.id}{C['r']}  {C['gry']}{e.install}{C['r']}")
-            subprocess.run(e.install, shell=True)
-        return 0
+        # 保留老入口的非交互行为，但统一走 repair：去重、复检、失败返回非 0。
+        return cmd_repair(entries, [*args[1:], "--yes"])
     e = find_entry(entries, args[0])
     if not e:
         return die(f"注册表里没有 「{args[0]}」")
@@ -3216,10 +3266,11 @@ def usage():
     ag edit               用 $EDITOR 打开注册表
     ag scan               扫描 PATH，发现装了但没登记的 agent
     ag doctor             体检：哪些能跑、哪些缺
+    ag doctor --json      机器可读的体检结果
     ag repair             修复缺失项（默认先确认，--dry-run 预览）
     ag doctor --fix       体检并修复（等价于 ag repair）
     ag install <id>       按登记的 install 命令安装
-    ag install --missing  一键补装所有缺失的
+    ag install --missing  兼容旧入口（等价于 ag repair --yes）
     ag which <id>         显示实际会执行的命令
     ag path               打印注册表路径
 
