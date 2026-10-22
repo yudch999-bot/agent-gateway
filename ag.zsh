@@ -56,6 +56,7 @@ _ag() {
       profile|profiles)
         compadd -X '操作' -- ls show add rm
         (( ${#ids} )) && compadd -X 'agent' -- $ids ;;
+      scan) compadd -X '选项' -- --json --register ;;
       edit) compadd -X '选项' -- --project ;;
       validate) compadd -X '选项' -- --json --strict ;;
       doctor) compadd -X '选项' -- --json --fix --dry-run --yes ;;

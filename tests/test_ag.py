@@ -699,6 +699,53 @@ finally:
     shutil.rmtree(PROJ_DIR, ignore_errors=True)
 
 say()
+say("14.7) ag scan --register")
+SCAN_DIR = tempfile.mkdtemp(prefix="ag-scan-")
+SCAN_REG = os.path.join(SCAN_DIR, "registry.toml")
+with open(SCAN_REG, "w", encoding="utf-8") as f:
+    f.write('[[agent]]\nid = "cc"\ncmd = "echo"\n')
+saved_reg = ag.REGISTRY
+saved_which = ag.shutil.which
+class TtyInput(io.StringIO):
+    def isatty(self):
+        return True
+ag.REGISTRY = SCAN_REG
+ag.shutil.which = lambda name: f"/fake/bin/{name}" \
+    if name in ("cursor-agent", "aider") else None
+try:
+    rc, o = runcmd(["scan", "--json"])
+    data = json.loads(o)
+    check("scan --json 输出未登记清单",
+          rc == 0 and {x["id"] for x in data} == {"cursor-agent", "aider"},
+          o[:300])
+
+    saved_stdin = ag.sys.stdin
+    ag.sys.stdin = io.StringIO()
+    try:
+        rc, o, e = runcmd_err(["scan", "--register"])
+    finally:
+        ag.sys.stdin = saved_stdin
+    check("scan --register 非交互时拒绝", rc != 0 and "非交互" in e,
+          (o + e)[:300])
+
+    saved_stdin = ag.sys.stdin
+    ag.sys.stdin = TtyInput("1 2\n")
+    try:
+        rc, o = runcmd(["scan", "--register"])
+    finally:
+        ag.sys.stdin = saved_stdin
+    ids = {e.id for e in ag.load_registry()}
+    check("scan --register 批量登记",
+          rc == 0 and {"cursor-agent", "aider"} <= ids, str(ids))
+    check("自动登记的 group / cmd 正确",
+          all(e.group == "自动发现" and e.cmd.startswith("/fake/bin/")
+              for e in ag.load_registry() if e.id in ("cursor-agent", "aider")))
+finally:
+    ag.REGISTRY = saved_reg
+    ag.shutil.which = saved_which
+    shutil.rmtree(SCAN_DIR, ignore_errors=True)
+
+say()
 say("15) 批量升级：命令提取与执行")
 say("  · 包名提取")
 for cmd, want in [("npm i -g @scope/pkg@latest", "@scope/pkg"),

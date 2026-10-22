@@ -72,7 +72,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -3723,6 +3723,11 @@ qwen-code iflow roo-cline kilo codebuff warp oz
 
 
 def cmd_scan(entries, args):
+    as_json = "--json" in args
+    register = "--register" in args
+    unknown = [a for a in args if a not in ("--json", "--register")]
+    if unknown or (as_json and register):
+        return die("用法：ag scan [--json | --register]")
     registered = set()
     for e in entries:
         registered.add(e.cmd)
@@ -3740,9 +3745,56 @@ def cmd_scan(entries, args):
     if not found:
         print(f"  {C['grn']}✓ 没有发现未登记的 agent{C['r']}")
         return 0
+
+    if as_json:
+        print(json.dumps([{"id": name, "cmd": path, "path": path}
+                          for name, path in found],
+                         ensure_ascii=False, indent=2))
+        return 0
+
     print(f"\n  {C['b']}发现 {len(found)} 个已安装但没登记的 agent：{C['r']}\n")
-    for name, p in found:
-        print(f"  {C['grn']}+{C['r']} {C['b']}{pad(name, 16)}{C['r']} {C['gry']}{p}{C['r']}")
+    for i, (name, p) in enumerate(found, 1):
+        print(f"  {C['grn']}{i:>2}.{C['r']} {C['b']}{pad(name, 16)}{C['r']} "
+              f"{C['gry']}{p}{C['r']}")
+    if register:
+        if not sys.stdin.isatty():
+            return die("非交互环境请用 ag scan --json，再手动 ag add")
+        try:
+            ans = input(f"\n  {C['b']}选择编号（空格分隔，a=全部，回车取消）"
+                        f"{C['r']} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not ans:
+            print(f"  {C['gry']}已取消{C['r']}")
+            return 0
+        if ans.lower() in ("a", "all", "*"):
+            chosen = found
+        else:
+            chosen, bad = [], []
+            for tok in ans.replace(",", " ").split():
+                if not tok.isdigit() or not (1 <= int(tok) <= len(found)):
+                    bad.append(tok)
+                    continue
+                chosen.append(found[int(tok) - 1])
+            if bad:
+                return die("无效编号：" + "、".join(bad))
+            chosen = list(dict.fromkeys(chosen))
+        if not chosen:
+            return 0
+        blocks = []
+        for name, path in chosen:
+            e = Entry(dict(id=name, name=name, cmd=path,
+                           desc="PATH 自动发现", tags=["auto"],
+                           group="自动发现"))
+            blocks.append("\n# ── 由 `ag scan --register` 添加 ──\n"
+                          + render_toml(e))
+        backup_registry()
+        with open(REGISTRY, "a", encoding="utf-8") as f:
+            f.write("".join(blocks))
+        print(f"\n  {C['grn']}✓ 已登记 {len(chosen)} 个{C['r']}："
+              f"{C['b']}{'、'.join(name for name, _ in chosen)}{C['r']}")
+        return 0
     print(f"\n  {C['gry']}登记它：  ag add --id {found[0][0]} --cmd {found[0][1]}{C['r']}\n")
     return 0
 
@@ -4295,6 +4347,7 @@ def usage():
     ag rm <id> [id...]   删除（可一次删多条，注释保留）
     ag edit               用 $EDITOR 打开注册表（--project 编辑 .ag.toml）
     ag scan               扫描 PATH，发现装了但没登记的 agent
+    ag scan --register    交互选择并登记
     ag validate           静态检查注册表（--json / --strict）
     ag doctor             体检：哪些能跑、哪些缺
     ag doctor --json      机器可读的体检结果

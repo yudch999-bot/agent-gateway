@@ -183,6 +183,8 @@ ag deepseek    →  d
 | `ag rm <id>` | 删除（保留注释，自动备份） |
 | `ag edit` | 用 `$EDITOR` 打开注册表（`--project` 编辑项目配置） |
 | `ag scan` | 扫描 `PATH`，找出装了但没登记的 |
+| **`ag scan --register`** | **交互多选，直接写入注册表** |
+| `ag scan --json` | 机器可读的未登记清单 |
 | **`ag validate`** | **静态检查注册表：重复 id/alias、保留名冲突、坏路径、team 引用** |
 | `ag validate --json` | 机器可读的检查结果 |
 | `ag validate --strict` | warning 也返回非 0，适合 CI |
