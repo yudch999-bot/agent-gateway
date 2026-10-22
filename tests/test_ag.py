@@ -336,6 +336,7 @@ id = "ok"
 name = "正常"
 cmd = "echo"
 alias = ["doctor"]
+resume_session = ["resume", "{{bogus}}"]
 sessions = "{os.path.join(VAL_DIR, "no-sessions")}"
 mystery = "x"
 
@@ -366,6 +367,11 @@ agents = ["missing"]
 layout = "wat"
 grid = "wat"
 extra = true
+
+[[profile]]
+id = "work"
+agent = "missing"
+oops = true
 ''')
 with open(VAL_WARN, "w", encoding="utf-8") as fh:
     fh.write(f'''
@@ -401,8 +407,12 @@ try:
           {"alias_reserved", "id_reserved", "name_duplicate"} <= codes, str(codes))
     check("抓到未知字段 / sessions 警告",
           {"unknown_field", "sessions_missing"} <= codes, str(codes))
+    check("抓到 resume_session 非法占位符",
+          "resume_session_placeholder" in codes, str(codes))
     check("抓到 team 成员 / 布局 / 网格问题",
           {"team_agent_missing", "team_layout_invalid", "team_grid_invalid"} <= codes,
+          str(codes))
+    check("抓到 profile 引用不存在 agent", "profile_agent_missing" in codes,
           str(codes))
     check("summary 计数一致",
           data["summary"]["errors"] == sum(1 for x in data["issues"]
@@ -551,6 +561,189 @@ rc, o = runcmd(["stats"])
 check("ag stats 出表格", rc == 0 and "使用统计" in o and "goose" in o)
 rc, o = runcmd(["stats", "--history"])
 check("ag stats --history 出时间线", rc == 0 and "最近的启动" in o)
+
+say()
+say("14.5) Profiles —— agent@profile")
+PROF_DIR = tempfile.mkdtemp(prefix="ag-profile-")
+PROF_REG = os.path.join(PROF_DIR, "registry.toml")
+with open(PROF_REG, "w", encoding="utf-8") as f:
+    f.write('''
+[[agent]]
+id = "cc"
+name = "Claude"
+cmd = "echo"
+args = ["--base"]
+env = { BASE = "agent", KEEP = "yes" }
+resume = ["--resume"]
+sessions = "/tmp"
+
+[[profile]]
+id = "work"
+agent = "cc"
+name = "Claude Work"
+args = ["--model", "sonnet"]
+env = { BASE = "profile", API_URL = "${API_URL}" }
+cwd = "/tmp"
+''')
+saved_reg = ag.REGISTRY
+ag.REGISTRY = PROF_REG
+try:
+    profiles = ag.load_profiles()
+    p = ag.find_profile(profiles, "cc@work")
+    base = ag.find_entry(ag.load_registry(), "cc")
+    pe = p.as_entry(base)
+    check("profile 能解析合并后的 Entry",
+          pe.id == "cc@work" and pe.args == ["--base", "--model", "sonnet"]
+          and pe.env == {"BASE": "profile", "KEEP": "yes",
+                         "API_URL": "${API_URL}"} and pe.cwd == "/tmp",
+          str((pe.args, pe.env, pe.cwd)))
+    check("resolve_entry 支持普通 agent 和 profile",
+          ag.resolve_entry([base], "cc").id == "cc"
+          and ag.resolve_entry([base], "cc@work").id == "cc@work")
+
+    rc, o = runcmd(["profile", "ls", "--json"])
+    data = json.loads(o)
+    check("profile ls --json", rc == 0 and data[0]["ref"] == "cc@work", o[:200])
+    rc, o = runcmd(["profile", "show", "cc@work"])
+    check("profile show", rc == 0 and "echo --base --model sonnet" in o, o[:300])
+    rc, o = runcmd(["which", "cc@work"])
+    check("ag which 支持 profile",
+          rc == 0 and "echo --base --model sonnet" in o, o[:300])
+
+    out, got, _ = run([], argv=["ag", "cc@work"])
+    check("直接 ag cc@work 启动合并后的 Entry",
+          got.get("launched", ("",))[0] == "cc@work", str(got))
+
+    rc, o = runcmd(["profile", "add", "--agent", "cc", "--id", "fast",
+                    "--args=--fast", "--env", "A=1"])
+    check("profile add", rc == 0 and ag.find_profile(ag.load_profiles(), "cc@fast"))
+    rc, o = runcmd(["profile", "rm", "cc@fast"])
+    check("profile rm", rc == 0 and not ag.find_profile(ag.load_profiles(), "cc@fast"))
+    rc, o, e = runcmd_err(["profile", "rm", "cc@missing"])
+    check("profile rm 不存在时报错", rc != 0, (o + e)[:200])
+finally:
+    ag.REGISTRY = saved_reg
+    shutil.rmtree(PROF_DIR, ignore_errors=True)
+
+say()
+say("14.6) 项目级 .ag.toml")
+PROJ_DIR = tempfile.mkdtemp(prefix="ag-project-")
+PROJ_GLOBAL = os.path.join(PROJ_DIR, "global.toml")
+PROJ_OVERLAY = os.path.join(PROJ_DIR, "project.toml")
+with open(PROJ_GLOBAL, "w", encoding="utf-8") as f:
+    f.write('''
+[[agent]]
+id = "cc"
+name = "Claude"
+cmd = "echo"
+args = ["--base"]
+env = { A = "global", B = "keep" }
+
+[[team]]
+id = "pair"
+agents = ["cc"]
+''')
+with open(PROJ_OVERLAY, "w", encoding="utf-8") as f:
+    f.write('''
+[[agent]]
+id = "cc"
+name = "Claude Project"
+args = ["--project"]
+env = { A = "project", C = "new" }
+cwd = "/tmp"
+
+[[agent]]
+id = "px"
+name = "Project Only"
+cmd = "echo"
+
+[[team]]
+id = "pair"
+agents = ["cc", "px"]
+layout = "windows"
+
+[[profile]]
+id = "work"
+agent = "cc"
+args = ["--model", "sonnet"]
+''')
+saved_reg, saved_project = ag.REGISTRY, ag.PROJECT_REGISTRY
+ag.REGISTRY, ag.PROJECT_REGISTRY = PROJ_GLOBAL, PROJ_OVERLAY
+try:
+    ents = ag.load_registry()
+    by_id = {e.id: e for e in ents}
+    check("project 覆盖同 id agent（args 替换、env 深度合并）",
+          by_id["cc"].args == ["--project"]
+          and by_id["cc"].env == {"A": "project", "B": "keep", "C": "new"}
+          and by_id["cc"].cwd == "/tmp", str((by_id["cc"].args, by_id["cc"].env)))
+    check("project 新增 agent", "px" in by_id)
+    teams = ag.load_teams()
+    check("project team 覆盖", teams[0].agents == ["cc", "px"]
+          and teams[0].layout == "windows", str(teams[0].agents))
+    check("project profile 合并",
+          ag.find_profile(ag.load_profiles(), "cc@work") is not None)
+    rc, o = runcmd(["path"])
+    check("ag path 同时显示全局和项目注册表",
+          PROJ_GLOBAL in o and PROJ_OVERLAY in o, o)
+
+    old_cwd = os.getcwd()
+    os.chdir(PROJ_DIR)
+    try:
+        rc, o = runcmd(["init"])
+    finally:
+        os.chdir(old_cwd)
+    check("ag init 创建 .ag.toml",
+          rc == 0 and os.path.exists(os.path.join(PROJ_DIR, ".ag.toml")), o[:300])
+finally:
+    ag.REGISTRY, ag.PROJECT_REGISTRY = saved_reg, saved_project
+    shutil.rmtree(PROJ_DIR, ignore_errors=True)
+
+say()
+say("14.7) ag scan --register")
+SCAN_DIR = tempfile.mkdtemp(prefix="ag-scan-")
+SCAN_REG = os.path.join(SCAN_DIR, "registry.toml")
+with open(SCAN_REG, "w", encoding="utf-8") as f:
+    f.write('[[agent]]\nid = "cc"\ncmd = "echo"\n')
+saved_reg = ag.REGISTRY
+saved_which = ag.shutil.which
+class TtyInput(io.StringIO):
+    def isatty(self):
+        return True
+ag.REGISTRY = SCAN_REG
+ag.shutil.which = lambda name: f"/fake/bin/{name}" \
+    if name in ("cursor-agent", "aider") else None
+try:
+    rc, o = runcmd(["scan", "--json"])
+    data = json.loads(o)
+    check("scan --json 输出未登记清单",
+          rc == 0 and {x["id"] for x in data} == {"cursor-agent", "aider"},
+          o[:300])
+
+    saved_stdin = ag.sys.stdin
+    ag.sys.stdin = io.StringIO()
+    try:
+        rc, o, e = runcmd_err(["scan", "--register"])
+    finally:
+        ag.sys.stdin = saved_stdin
+    check("scan --register 非交互时拒绝", rc != 0 and "非交互" in e,
+          (o + e)[:300])
+
+    saved_stdin = ag.sys.stdin
+    ag.sys.stdin = TtyInput("1 2\n")
+    try:
+        rc, o = runcmd(["scan", "--register"])
+    finally:
+        ag.sys.stdin = saved_stdin
+    ids = {e.id for e in ag.load_registry()}
+    check("scan --register 批量登记",
+          rc == 0 and {"cursor-agent", "aider"} <= ids, str(ids))
+    check("自动登记的 group / cmd 正确",
+          all(e.group == "自动发现" and e.cmd.startswith("/fake/bin/")
+              for e in ag.load_registry() if e.id in ("cursor-agent", "aider")))
+finally:
+    ag.REGISTRY = saved_reg
+    ag.shutil.which = saved_which
+    shutil.rmtree(SCAN_DIR, ignore_errors=True)
 
 say()
 say("15) 批量升级：命令提取与执行")
@@ -994,6 +1187,37 @@ cmd = "echo"
                       argv=["ag", "history", "--limit=0"])
     check("history 输入筛选用 Enter 选中目标 agent",
           got.get("launched", ("",))[0] == "codex", str(got))
+
+    say("  · 精确会话续聊")
+    rs = ag.Entry(dict(id="rs", cmd="agent", args=["--base"],
+                       resume_session=["resume", "{id}", "--cwd", "{cwd}"]))
+    rs_argv = rs.resume_session_argv("abc-123", "/tmp/s.jsonl", "/tmp/proj")
+    check("resume_session 占位符展开",
+          rs_argv == ["agent", "--base", "resume", "abc-123",
+                      "--cwd", "/tmp/proj"], str(rs_argv))
+    uuid = "12345678-1234-1234-1234-123456789abc"
+    check("从会话文件名提取 UUID",
+          ag.session_id_from_path(f"/tmp/rollout-2026-{uuid}.jsonl") == uuid,
+          ag.session_id_from_path(f"/tmp/rollout-2026-{uuid}.jsonl"))
+    check("非 UUID 文件名退回去扩展名",
+          ag.session_id_from_path("/tmp/session-42.json") == "session-42")
+
+    real_launch_argv = ag.launch_argv
+    exact = {}
+    def fake_launch_argv(entry, argv, resumed=False):
+        exact.update(entry=entry.id, argv=argv, resumed=resumed)
+        return 0
+    cc.resume_session = ["--resume", "{id}"]
+    ag.launch_argv = fake_launch_argv
+    try:
+        rc = ag.launch_history_row(ents, cc_row)
+    finally:
+        ag.launch_argv = real_launch_argv
+        cc.resume_session = []
+    check("history 精确续聊走 resume_session",
+          rc == 0 and exact.get("entry") == "cc" and exact.get("resumed") is True
+          and exact.get("argv", [])[1:3] == ["--resume", "s1"],
+          str(exact))
 
     real_handoff = ag.cmd_handoff
     handoff_call = {}

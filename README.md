@@ -175,10 +175,16 @@ ag deepseek    →  d
 | 命令 | 作用 |
 |---|---|
 | `ag ls` | 列出全部（`--all` 含隐藏项，`--json` 机器可读） |
+| **`ag init`** | **在当前项目创建 `.ag.toml` 覆盖** |
 | `ag add` | 向导式添加 |
+| **`ag profile ls`** | **列出 agent profiles（`cc@work`）** |
+| `ag profile add` | 添加 profile（参数 / env / cwd 预设） |
+| `ag profile rm` | 删除 profile |
 | `ag rm <id>` | 删除（保留注释，自动备份） |
-| `ag edit` | 用 `$EDITOR` 打开注册表 |
+| `ag edit` | 用 `$EDITOR` 打开注册表（`--project` 编辑项目配置） |
 | `ag scan` | 扫描 `PATH`，找出装了但没登记的 |
+| **`ag scan --register`** | **交互多选，直接写入注册表** |
+| `ag scan --json` | 机器可读的未登记清单 |
 | **`ag validate`** | **静态检查注册表：重复 id/alias、保留名冲突、坏路径、team 引用** |
 | `ag validate --json` | 机器可读的检查结果 |
 | `ag validate --strict` | warning 也返回非 0，适合 CI |
@@ -444,10 +450,15 @@ ag resume        # 不知道续哪个？列出所有支持续聊的
 resume = ["--resume"]     # 选项式，如 claude / grok
 resume = ["resume"]       # 子命令式，如 codex / omx
 resume = ["session", "--resume"]   # 更长的，如 goose
+resume_session = ["--resume", "{id}"]   # 精确续聊某个会话
 ```
 
 示例注册表里 **32 条有 17 条**已经填好了（都实测过 `--help`，不是猜的）。
 没填的按 `Ctrl-R` 会明确提示你去加，而不是默默开个新会话。
+
+`resume_session` 支持 `{id}` / `{path}` / `{cwd}`。配置后，`ag history`
+回车会直接续聊选中的那条会话；未配置则继续使用 agent 自己的续聊选择器。
+示例注册表已经给 `cc` 和 `codex` 填好。
 
 `ag stats` 能看你到底在用哪些：
 
@@ -584,6 +595,7 @@ cwd = "~/work"                # 启动目录，支持 ~
 install = "npm i -g myagent"  # 给 `ag install` 用
 update = "npm i -g myagent@latest"   # 给 `ag update` 用（不给就退回 install）
 resume = ["--resume"]         # 续聊参数，给 `ag resume` / Ctrl-R 用
+resume_session = ["--resume", "{id}"]  # 精确续聊；支持 {id}/{path}/{cwd}
 sessions = "~/.myagent/sessions"     # 会话历史目录，给 history / search / handoff 用
 group = "我的工具"             # 选择器里的分组标题；不填归到「其它」
 hidden = false                # true 则不进选择器
@@ -596,9 +608,65 @@ ag add --id k9s --cmd k9s --desc "K8s 面板"
 ag add --id gp --cmd git --args "pull --rebase" --desc "拉取变基"
 ```
 
+### Profiles：同一个 agent，多套启动配置
+
+同一个 Claude / Codex 经常要切不同供应商、模型或 Base URL。不要复制两条 agent，
+加一个 profile：
+
+```toml
+[[profile]]
+id = "work"
+agent = "cc"
+name = "Claude · 工作"
+args = ["--model", "sonnet"]
+env = { ANTHROPIC_BASE_URL = "${ANTHROPIC_WORK_URL}" }
+cwd = "~/work"
+```
+
+```bash
+ag cc@work                 # 启动 profile
+ag profile ls              # 看全部 profile
+ag profile show cc@work    # 看合并后的命令/环境
+ag profile add --agent cc --id fast --args=--fast
+ag profile rm cc@fast
+```
+
+`env` 在启动时做环境变量展开（`${VAR}`），注册表里不要直接写 API Key。
+Profile 会继承基础 agent 的 `cmd / resume / sessions / install`，只覆盖
+`args / env / cwd / name / desc / hidden`。
+
 ---
 
 ## 进阶
+
+### 项目级 `.ag.toml`
+
+```bash
+cd ~/work/my-project
+ag init
+ag edit --project
+```
+
+`ag` 会从当前目录向上查找 `.ag.toml`，自动叠加到全局注册表：
+
+- 同 `id` 的 agent 覆盖全局字段
+- `env` 做深度合并
+- 新 agent / team / profile 直接追加
+- 显式设置 `AG_REGISTRY` 时，项目配置不自动加载
+
+```toml
+[[agent]]
+id = "cc"
+cwd = "."
+env = { ANTHROPIC_BASE_URL = "${ANTHROPIC_WORK_URL}" }
+
+[[profile]]
+id = "work"
+agent = "cc"
+args = ["--model", "sonnet"]
+```
+
+`ag path` 会同时打印全局注册表和当前项目配置文件。
 
 ### 用另一份注册表
 
