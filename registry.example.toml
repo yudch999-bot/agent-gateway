@@ -19,6 +19,7 @@
 #    cwd      启动目录，支持 ~
 #    alias    额外别名，`ag <alias>` 也能启动
 #    install  安装命令，`ag install <id>` 会执行它
+#    resume_session  精确续聊模板，支持 {id} / {path} / {cwd}
 #    hidden   true 则不在选择器里显示（仍可 ag <id> 直接启动）
 #
 #  不想要某条？  ag rm <id>      （只删那一块，注释会保留）
@@ -57,6 +58,7 @@ desc = "Anthropic 官方 CLI"
 tags = ["anthropic", "official"]
 alias = ["claude"]
 resume = ["--resume"]
+resume_session = ["--resume", "{id}"]
 install = "curl -fsSL https://claude.ai/install.sh | bash"
 
 # ---------- 3. Codex ----------
@@ -69,6 +71,7 @@ sessions = "~/.codex/sessions"
 desc = "OpenAI 官方 CLI"
 tags = ["openai", "official"]
 resume = ["resume"]
+resume_session = ["resume", "{id}"]
 install = "npm i -g @openai/codex@latest"
 
 # ---------- 4. Gemini CLI ----------

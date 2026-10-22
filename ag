@@ -55,7 +55,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -76,8 +76,8 @@ else:
 
 class Entry:
     __slots__ = ("id", "name", "cmd", "args", "desc", "tags", "alias", "env",
-                 "cwd", "install", "update", "resume", "sessions", "group",
-                 "hidden", "raw")
+                 "cwd", "install", "update", "resume", "resume_session",
+                 "sessions", "group", "hidden", "raw")
 
     def __init__(self, d: dict):
         self.raw = d
@@ -95,6 +95,9 @@ class Entry:
         # resume 是「继续上次会话」的参数，比如 ["--resume"]、["resume"]。
         # 缺省不填就表示这个 agent 不支持续聊，ag resume 会明确告诉你。
         self.resume = [str(a) for a in d.get("resume", [])]
+        # resume_session 允许直接把某个具体会话交给 agent：
+        # ["--resume", "{id}"] / ["resume", "{id}"]。
+        self.resume_session = [str(a) for a in d.get("resume_session", [])]
         # 会话历史目录，给 ag search / ag handoff 用。
         # 各家格式私有，所以这里只记「去哪找」，解析交给下面的通用提取器。
         self.sessions = str(d.get("sessions", "")).strip()
@@ -109,6 +112,10 @@ class Entry:
     @property
     def can_resume(self):
         return bool(self.resume)
+
+    @property
+    def can_resume_session(self):
+        return bool(self.resume_session)
 
     def haystack(self) -> str:
         return " ".join([self.id, self.name, self.desc, self.cmd,
@@ -128,6 +135,16 @@ class Entry:
 
     def resume_argv(self, extra=None):
         return [self.cmd, *self.args, *self.resume, *(extra or [])]
+
+    def resume_session_argv(self, session_id, path, cwd=None, extra=None):
+        values = {"id": session_id or "", "path": path or "",
+                  "cwd": cwd or ""}
+        expanded = []
+        for arg in self.resume_session:
+            for key, value in values.items():
+                arg = arg.replace("{" + key + "}", str(value))
+            expanded.append(arg)
+        return [self.cmd, *self.args, *expanded, *(extra or [])]
 
     def config_dir(self):
         """猜这个 agent 的配置目录，给 Ctrl-O 用。"""
@@ -501,7 +518,8 @@ def die(msg, code=1):
 
 # ---------------------------------------------------------------- 启动
 
-def cmd_launch(e: Entry, extra, resume=False):
+def launch_argv(e: Entry, argv, resumed=False):
+    """用给定 argv 启动；供普通启动、精确会话和 profile 复用。"""
     path = e.resolved()
     if not path:
         print(f"{C['red']}✗ 找不到可执行文件 「{e.cmd}」{C['r']}")
@@ -510,13 +528,6 @@ def cmd_launch(e: Entry, extra, resume=False):
         else:
             print(f"  用 {C['cyn']}ag edit{C['r']} 检查 registry.toml 里的 cmd 字段")
         return 127
-
-    if resume and not e.can_resume:
-        print(f"{C['yel']}!{C['r']} {C['b']}{e.id}{C['r']} 没登记续聊方式，"
-              f"这次按新会话启动")
-        print(f"  {C['gry']}想支持的话在注册表里加一行，例如：  "
-              f"resume = [\"--resume\"]{C['r']}")
-        resume = False
 
     if e.cwd:
         target = os.path.expanduser(e.cwd)
@@ -527,15 +538,14 @@ def cmd_launch(e: Entry, extra, resume=False):
 
     env = os.environ.copy()
     env.update(e.env)
-    argv = e.resume_argv(extra) if resume else e.argv(extra)
 
     # 先记账再 exec —— execvpe 一调用这个进程就没了，之后写不了
     try:
-        record_use(e.id, os.getcwd(), resumed=resume)
+        record_use(e.id, os.getcwd(), resumed=resumed)
     except Exception:
         pass
 
-    tag = f" {C['mag']}↻ 续聊{C['r']}" if resume else ""
+    tag = f" {C['mag']}↻ 续聊{C['r']}" if resumed else ""
     print(f"{C['grn']}▶{C['r']} {C['b']}{e.name}{C['r']} "
           f"{C['gry']}({e.id}){C['r']}{tag}  {C['dim']}{' '.join(argv)}{C['r']}")
     sys.stdout.flush()
@@ -548,6 +558,17 @@ def cmd_launch(e: Entry, extra, resume=False):
         return die(f"启动失败：{path} 没有执行权限")
     except OSError as ex:
         return die(f"启动失败：{ex}")
+
+
+def cmd_launch(e: Entry, extra, resume=False):
+    if resume and not e.can_resume:
+        print(f"{C['yel']}!{C['r']} {C['b']}{e.id}{C['r']} 没登记续聊方式，"
+              f"这次按新会话启动")
+        print(f"  {C['gry']}想支持的话在注册表里加一行，例如：  "
+              f"resume = [\"--resume\"]{C['r']}")
+        resume = False
+    argv = e.resume_argv(extra) if resume else e.argv(extra)
+    return launch_argv(e, argv, resumed=resume)
 
 
 # ---------------------------------------------------------------- 一次开多个
@@ -1945,6 +1966,8 @@ def cmd_which(entries, args):
     print(f"  路径  : {p or C['red'] + '（未安装）' + C['r']}")
     if e.can_resume:
         print(f"  续聊  : {' '.join(e.resume_argv(args[1:]))}")
+    if e.can_resume_session:
+        print(f"  精确续聊: {' '.join(e.resume_session)}")
     if e.cwd:
         print(f"  目录  : {e.cwd}")
     if e.env:
@@ -2371,7 +2394,7 @@ def history_rows(entries, refresh=False, max_scan=HISTORY_MAX_SCAN):
             "title": meta.get("title"),
             "mtime": mtime,
             "timestamp": meta.get("ts"),
-            "can_resume": e.can_resume,
+            "can_resume": e.can_resume or e.can_resume_session,
         })
     save_history_cache(cache)
     return rows
@@ -2393,6 +2416,22 @@ def history_match(row, query):
 
 def history_when(row):
     return fmt_session_time(row.get("timestamp")) or human_age(row["mtime"])
+
+
+_SESSION_UUID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def session_id_from_path(path):
+    """从会话文件名提取 UUID；没有 UUID 就用去扩展名的文件名。"""
+    name = os.path.basename(path)
+    for suffix in (".jsonl", ".json"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    m = _SESSION_UUID.search(name)
+    return m.group(0) if m else name
 
 
 def print_history(rows, limit=50):
@@ -2571,6 +2610,14 @@ def launch_history_row(entries, row):
     if cwd and os.path.isdir(os.path.expanduser(cwd)):
         e.cwd = cwd
     try:
+        if e.can_resume_session:
+            sid = session_id_from_path(row["path"])
+            argv = e.resume_session_argv(sid, row["path"], cwd)
+            print(f"  {C['gry']}从 {short_cwd(cwd)} 精确续聊 "
+                  f"{trunc(sid, 36)}{C['r']}")
+            return launch_argv(e, argv, resumed=True)
+        if not e.can_resume:
+            return die(f"{e.id} 没有登记续聊方式")
         print(f"  {C['gry']}从 {short_cwd(cwd)} 继续；"
               f"具体会话由 {e.id} 自己选择{C['r']}")
         return cmd_launch(e, [], resume=True)
@@ -3215,6 +3262,8 @@ def render_toml(e: Entry):
         L.append(f"update = {toml_str(e.update)}")
     if e.resume:
         L.append(f"resume = {toml_arr(e.resume)}")
+    if e.resume_session:
+        L.append(f"resume_session = {toml_arr(e.resume_session)}")
     if e.sessions:
         L.append(f"sessions = {toml_str(e.sessions)}")
     if e.group:
@@ -3390,7 +3439,7 @@ team teams multi attach ps kill stop path help
 
 AGENT_FIELDS = {
     "id", "name", "cmd", "args", "desc", "tags", "alias", "env", "cwd",
-    "install", "update", "resume", "sessions", "group", "hidden",
+    "install", "update", "resume", "resume_session", "sessions", "group", "hidden",
 }
 TEAM_FIELDS = {"id", "name", "desc", "agents", "layout", "grid", "resume", "session"}
 
@@ -3493,9 +3542,16 @@ def validate_registry():
         for key in d:
             if key not in AGENT_FIELDS:
                 warn("unknown_field", subject, f"未知字段「{key}」")
-        for key in ("args", "tags", "resume"):
+        for key in ("args", "tags", "resume", "resume_session"):
             if key in d and not _string_list(d[key]):
                 err(f"{key}_invalid", subject, f"{key} 必须是字符串数组")
+        if _string_list(d.get("resume_session", [])):
+            allowed = {"id", "path", "cwd"}
+            for arg in d.get("resume_session", []):
+                for name in re.findall(r"\{([^{}]+)\}", str(arg)):
+                    if name not in allowed:
+                        err("resume_session_placeholder", subject,
+                            f"未知占位符「{{{name}}}」")
         if "env" in d and not isinstance(d["env"], dict):
             err("env_invalid", subject, "env 必须是表")
         for key in ("install", "update"):

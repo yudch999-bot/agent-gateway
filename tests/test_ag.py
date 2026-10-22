@@ -336,6 +336,7 @@ id = "ok"
 name = "正常"
 cmd = "echo"
 alias = ["doctor"]
+resume_session = ["resume", "{{bogus}}"]
 sessions = "{os.path.join(VAL_DIR, "no-sessions")}"
 mystery = "x"
 
@@ -401,6 +402,8 @@ try:
           {"alias_reserved", "id_reserved", "name_duplicate"} <= codes, str(codes))
     check("抓到未知字段 / sessions 警告",
           {"unknown_field", "sessions_missing"} <= codes, str(codes))
+    check("抓到 resume_session 非法占位符",
+          "resume_session_placeholder" in codes, str(codes))
     check("抓到 team 成员 / 布局 / 网格问题",
           {"team_agent_missing", "team_layout_invalid", "team_grid_invalid"} <= codes,
           str(codes))
@@ -994,6 +997,37 @@ cmd = "echo"
                       argv=["ag", "history", "--limit=0"])
     check("history 输入筛选用 Enter 选中目标 agent",
           got.get("launched", ("",))[0] == "codex", str(got))
+
+    say("  · 精确会话续聊")
+    rs = ag.Entry(dict(id="rs", cmd="agent", args=["--base"],
+                       resume_session=["resume", "{id}", "--cwd", "{cwd}"]))
+    rs_argv = rs.resume_session_argv("abc-123", "/tmp/s.jsonl", "/tmp/proj")
+    check("resume_session 占位符展开",
+          rs_argv == ["agent", "--base", "resume", "abc-123",
+                      "--cwd", "/tmp/proj"], str(rs_argv))
+    uuid = "12345678-1234-1234-1234-123456789abc"
+    check("从会话文件名提取 UUID",
+          ag.session_id_from_path(f"/tmp/rollout-2026-{uuid}.jsonl") == uuid,
+          ag.session_id_from_path(f"/tmp/rollout-2026-{uuid}.jsonl"))
+    check("非 UUID 文件名退回去扩展名",
+          ag.session_id_from_path("/tmp/session-42.json") == "session-42")
+
+    real_launch_argv = ag.launch_argv
+    exact = {}
+    def fake_launch_argv(entry, argv, resumed=False):
+        exact.update(entry=entry.id, argv=argv, resumed=resumed)
+        return 0
+    cc.resume_session = ["--resume", "{id}"]
+    ag.launch_argv = fake_launch_argv
+    try:
+        rc = ag.launch_history_row(ents, cc_row)
+    finally:
+        ag.launch_argv = real_launch_argv
+        cc.resume_session = []
+    check("history 精确续聊走 resume_session",
+          rc == 0 and exact.get("entry") == "cc" and exact.get("resumed") is True
+          and exact.get("argv", [])[1:3] == ["--resume", "s1"],
+          str(exact))
 
     real_handoff = ag.cmd_handoff
     handoff_call = {}

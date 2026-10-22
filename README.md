@@ -444,10 +444,15 @@ ag resume        # 不知道续哪个？列出所有支持续聊的
 resume = ["--resume"]     # 选项式，如 claude / grok
 resume = ["resume"]       # 子命令式，如 codex / omx
 resume = ["session", "--resume"]   # 更长的，如 goose
+resume_session = ["--resume", "{id}"]   # 精确续聊某个会话
 ```
 
 示例注册表里 **32 条有 17 条**已经填好了（都实测过 `--help`，不是猜的）。
 没填的按 `Ctrl-R` 会明确提示你去加，而不是默默开个新会话。
+
+`resume_session` 支持 `{id}` / `{path}` / `{cwd}`。配置后，`ag history`
+回车会直接续聊选中的那条会话；未配置则继续使用 agent 自己的续聊选择器。
+示例注册表已经给 `cc` 和 `codex` 填好。
 
 `ag stats` 能看你到底在用哪些：
 
@@ -584,6 +589,7 @@ cwd = "~/work"                # 启动目录，支持 ~
 install = "npm i -g myagent"  # 给 `ag install` 用
 update = "npm i -g myagent@latest"   # 给 `ag update` 用（不给就退回 install）
 resume = ["--resume"]         # 续聊参数，给 `ag resume` / Ctrl-R 用
+resume_session = ["--resume", "{id}"]  # 精确续聊；支持 {id}/{path}/{cwd}
 sessions = "~/.myagent/sessions"     # 会话历史目录，给 history / search / handoff 用
 group = "我的工具"             # 选择器里的分组标题；不填归到「其它」
 hidden = false                # true 则不进选择器
