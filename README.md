@@ -179,6 +179,9 @@ ag deepseek    →  d
 | `ag rm <id>` | 删除（保留注释，自动备份） |
 | `ag edit` | 用 `$EDITOR` 打开注册表 |
 | `ag scan` | 扫描 `PATH`，找出装了但没登记的 |
+| **`ag validate`** | **静态检查注册表：重复 id/alias、保留名冲突、坏路径、team 引用** |
+| `ag validate --json` | 机器可读的检查结果 |
+| `ag validate --strict` | warning 也返回非 0，适合 CI |
 | `ag doctor` | 体检：逐条解析真实路径 |
 | `ag doctor --json` | 机器可读体检：路径、缺口和可修复方式 |
 | **`ag repair`** | **修复缺失项：先预览/确认，再逐条安装并复检** |
@@ -199,6 +202,29 @@ ag deepseek    →  d
 | **`ag search <关键词>`** | **在历史会话里搜**（1.8G 的记录不再躺着睡觉） |
 | **`ag handoff [id]`** | **把最近一次会话整理成交接 prompt，复制到剪贴板** |
 | `ag path` | 打印注册表路径 |
+
+---
+
+## 注册表体检：`ag validate`
+
+`ag validate` 不执行任何 agent，也不要求命令已经安装，专门检查注册表本身：
+
+```bash
+ag validate
+ag validate --json
+ag validate --strict
+```
+
+它会抓这些常见问题：
+
+- 重复 `id`、重复 `alias`
+- `id` / `alias` 和子命令重名，例如把 agent 叫 `repair`
+- 缺 `id`、缺 `cmd`
+- `sessions` / `cwd` 指向不存在的目录
+- `[[team]]` 引用了不存在的 agent
+- 未知字段、错误的数组/表类型、无效布局或宫格
+
+`--json` 输出 `summary + issues[]`，适合 CI。`--strict` 会把 warning 也当失败。
 
 ---
 
