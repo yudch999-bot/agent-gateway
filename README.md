@@ -10,7 +10,7 @@ Claude Code, Codex, Gemini, Grok, OpenCode, OpenClaw, Hermes, Pi, Goose, Kimi…
 Stop memorizing a dozen different launch commands and a dozen shell aliases.
 Put them all behind one fuzzy picker, and add your own by editing one line.
 
-它管三层：
+它管四层：
 
 | 层 | 命令 | 解决什么 |
 |---|---|---|
@@ -198,6 +198,35 @@ ag deepseek    →  d
 | **`ag search <关键词>`** | **在历史会话里搜**（1.8G 的记录不再躺着睡觉） |
 | **`ag handoff [id]`** | **把最近一次会话整理成交接 prompt，复制到剪贴板** |
 | `ag path` | 打印注册表路径 |
+
+---
+
+## 缺了怎么办：`ag repair`
+
+`ag doctor` 负责体检，`ag repair` 负责把能修的直接修好：
+
+```bash
+ag doctor             # 先看哪些显示 ○
+ag repair --dry-run   # 预览要执行哪些安装命令
+ag repair             # 展示计划，确认后逐条执行
+ag repair --yes       # 非交互执行，适合脚本
+ag doctor --fix       # 等价于 ag repair
+```
+
+规则很简单：
+
+- 只处理**命令找不到、且注册表登记了 `install`** 的条目。
+- 同一个可执行文件被多个入口共用时只安装一次，例如 `ot` 和 8 个 `ot-*`。
+- 每条安装完成后立刻重新解析 `PATH`，退出码为 0 但命令仍找不到也算失败。
+- 没有 `install` 命令的条目只列出来，不猜安装方式。
+- 默认先展示计划并确认；非交互环境必须显式加 `--yes`。
+- 安装失败、安装后仍未生效、或仍有手工项时，退出码为 `1`。
+
+> ⚠️ 安装命令来自注册表，其中可能有 `curl ... | sh`。
+> 执行前先看 `ag repair --dry-run`，确认来源后再继续。
+
+原来的 `ag install --missing` 仍然可用，但它不确认、也不复检；
+日常建议统一用 `ag repair`。
 
 ---
 
@@ -633,7 +662,8 @@ tests/test_install.sh    安装脚本回归测试
 不用。`ag` 每次运行重读注册表。只有改 `.zshrc` 才需要 `source ~/.zshrc`。
 
 **启动报「找不到可执行文件」？**
-那条的 `cmd` 不在 `PATH` 上。`cmd` 可以直接写绝对路径，或把它的 bin 目录加进 `PATH`。先 `ag doctor` 看哪条断了。
+那条的 `cmd` 不在 `PATH` 上。先 `ag doctor` 看哪条断了，再跑 `ag repair`；
+如果它没有登记 `install`，再把 `cmd` 改成绝对路径，或把对应的 bin 目录加进 `PATH`。
 
 **短名和子命令重名了？**
 子命令优先。登记一个短名叫 `ls` 的 agent，`ag ls` 会走子命令而不是启动它。换个短名。
