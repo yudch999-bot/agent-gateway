@@ -50,7 +50,7 @@ _ag() {
           (( ${#ids} )) && compadd -X 'agent' -- $ids
         fi ;;
       rm|which|install|repair) (( ${#ids} )) && compadd -X 'agent' -- $ids ;;
-      doctor) compadd -X '选项' -- --fix --dry-run --yes ;;
+      doctor) compadd -X '选项' -- --json --fix --dry-run --yes ;;
       repair) compadd -X '选项' -- --dry-run --yes ;;
       edit|ls|scan|path) _files ;;
       *) _files ;;

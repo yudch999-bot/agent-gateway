@@ -180,12 +180,13 @@ ag deepseek    →  d
 | `ag edit` | 用 `$EDITOR` 打开注册表 |
 | `ag scan` | 扫描 `PATH`，找出装了但没登记的 |
 | `ag doctor` | 体检：逐条解析真实路径 |
+| `ag doctor --json` | 机器可读体检：路径、缺口和可修复方式 |
 | **`ag repair`** | **修复缺失项：先预览/确认，再逐条安装并复检** |
 | `ag repair --dry-run` | 只看修复计划，不执行 |
 | `ag repair --yes` | 非交互执行修复 |
 | `ag doctor --fix` | 体检并修复，等价于 `ag repair` |
 | `ag install <id>` | 按登记的 `install` 命令安装 |
-| `ag install --missing` | 一键补装所有缺失的 |
+| `ag install --missing` | 兼容旧入口，等价于 `ag repair --yes` |
 | **`ag outdated`** | **看哪些有新版本**（npm / brew 能查的都查） |
 | **`ag update [id...]`** | **批量升级**，不带 id 会先列出命令再确认 |
 | `ag update --all` | 全部升级，不问 |
