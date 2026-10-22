@@ -367,6 +367,11 @@ agents = ["missing"]
 layout = "wat"
 grid = "wat"
 extra = true
+
+[[profile]]
+id = "work"
+agent = "missing"
+oops = true
 ''')
 with open(VAL_WARN, "w", encoding="utf-8") as fh:
     fh.write(f'''
@@ -406,6 +411,8 @@ try:
           "resume_session_placeholder" in codes, str(codes))
     check("抓到 team 成员 / 布局 / 网格问题",
           {"team_agent_missing", "team_layout_invalid", "team_grid_invalid"} <= codes,
+          str(codes))
+    check("抓到 profile 引用不存在 agent", "profile_agent_missing" in codes,
           str(codes))
     check("summary 计数一致",
           data["summary"]["errors"] == sum(1 for x in data["issues"]
@@ -554,6 +561,69 @@ rc, o = runcmd(["stats"])
 check("ag stats 出表格", rc == 0 and "使用统计" in o and "goose" in o)
 rc, o = runcmd(["stats", "--history"])
 check("ag stats --history 出时间线", rc == 0 and "最近的启动" in o)
+
+say()
+say("14.5) Profiles —— agent@profile")
+PROF_DIR = tempfile.mkdtemp(prefix="ag-profile-")
+PROF_REG = os.path.join(PROF_DIR, "registry.toml")
+with open(PROF_REG, "w", encoding="utf-8") as f:
+    f.write('''
+[[agent]]
+id = "cc"
+name = "Claude"
+cmd = "echo"
+args = ["--base"]
+env = { BASE = "agent", KEEP = "yes" }
+resume = ["--resume"]
+sessions = "/tmp"
+
+[[profile]]
+id = "work"
+agent = "cc"
+name = "Claude Work"
+args = ["--model", "sonnet"]
+env = { BASE = "profile", API_URL = "${API_URL}" }
+cwd = "/tmp"
+''')
+saved_reg = ag.REGISTRY
+ag.REGISTRY = PROF_REG
+try:
+    profiles = ag.load_profiles()
+    p = ag.find_profile(profiles, "cc@work")
+    base = ag.find_entry(ag.load_registry(), "cc")
+    pe = p.as_entry(base)
+    check("profile 能解析合并后的 Entry",
+          pe.id == "cc@work" and pe.args == ["--base", "--model", "sonnet"]
+          and pe.env == {"BASE": "profile", "KEEP": "yes",
+                         "API_URL": "${API_URL}"} and pe.cwd == "/tmp",
+          str((pe.args, pe.env, pe.cwd)))
+    check("resolve_entry 支持普通 agent 和 profile",
+          ag.resolve_entry([base], "cc").id == "cc"
+          and ag.resolve_entry([base], "cc@work").id == "cc@work")
+
+    rc, o = runcmd(["profile", "ls", "--json"])
+    data = json.loads(o)
+    check("profile ls --json", rc == 0 and data[0]["ref"] == "cc@work", o[:200])
+    rc, o = runcmd(["profile", "show", "cc@work"])
+    check("profile show", rc == 0 and "echo --base --model sonnet" in o, o[:300])
+    rc, o = runcmd(["which", "cc@work"])
+    check("ag which 支持 profile",
+          rc == 0 and "echo --base --model sonnet" in o, o[:300])
+
+    out, got, _ = run([], argv=["ag", "cc@work"])
+    check("直接 ag cc@work 启动合并后的 Entry",
+          got.get("launched", ("",))[0] == "cc@work", str(got))
+
+    rc, o = runcmd(["profile", "add", "--agent", "cc", "--id", "fast",
+                    "--args=--fast", "--env", "A=1"])
+    check("profile add", rc == 0 and ag.find_profile(ag.load_profiles(), "cc@fast"))
+    rc, o = runcmd(["profile", "rm", "cc@fast"])
+    check("profile rm", rc == 0 and not ag.find_profile(ag.load_profiles(), "cc@fast"))
+    rc, o, e = runcmd_err(["profile", "rm", "cc@missing"])
+    check("profile rm 不存在时报错", rc != 0, (o + e)[:200])
+finally:
+    ag.REGISTRY = saved_reg
+    shutil.rmtree(PROF_DIR, ignore_errors=True)
 
 say()
 say("15) 批量升级：命令提取与执行")

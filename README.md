@@ -176,6 +176,9 @@ ag deepseek    →  d
 |---|---|
 | `ag ls` | 列出全部（`--all` 含隐藏项，`--json` 机器可读） |
 | `ag add` | 向导式添加 |
+| **`ag profile ls`** | **列出 agent profiles（`cc@work`）** |
+| `ag profile add` | 添加 profile（参数 / env / cwd 预设） |
+| `ag profile rm` | 删除 profile |
 | `ag rm <id>` | 删除（保留注释，自动备份） |
 | `ag edit` | 用 `$EDITOR` 打开注册表 |
 | `ag scan` | 扫描 `PATH`，找出装了但没登记的 |
@@ -601,6 +604,33 @@ hidden = false                # true 则不进选择器
 ag add --id k9s --cmd k9s --desc "K8s 面板"
 ag add --id gp --cmd git --args "pull --rebase" --desc "拉取变基"
 ```
+
+### Profiles：同一个 agent，多套启动配置
+
+同一个 Claude / Codex 经常要切不同供应商、模型或 Base URL。不要复制两条 agent，
+加一个 profile：
+
+```toml
+[[profile]]
+id = "work"
+agent = "cc"
+name = "Claude · 工作"
+args = ["--model", "sonnet"]
+env = { ANTHROPIC_BASE_URL = "${ANTHROPIC_WORK_URL}" }
+cwd = "~/work"
+```
+
+```bash
+ag cc@work                 # 启动 profile
+ag profile ls              # 看全部 profile
+ag profile show cc@work    # 看合并后的命令/环境
+ag profile add --agent cc --id fast --args=--fast
+ag profile rm cc@fast
+```
+
+`env` 在启动时做环境变量展开（`${VAR}`），注册表里不要直接写 API Key。
+Profile 会继承基础 agent 的 `cmd / resume / sessions / install`，只覆盖
+`args / env / cwd / name / desc / hidden`。
 
 ---
 

@@ -40,7 +40,7 @@ _ag() {
   local t
   for t in $teams; do trefs+=("@$t"); done
   if (( CURRENT == 2 )); then
-    compadd -X '子命令' -- ls add rm edit scan validate doctor repair install which history search handoff stats teams team path help
+    compadd -X '子命令' -- ls add rm edit scan validate doctor repair install which history search handoff stats teams team profile path help
     (( ${#ids} )) && compadd -X 'agent（也可直接敲关键词再 Tab）' -- $ids
   else
     case ${words[2]} in
@@ -52,6 +52,9 @@ _ag() {
       rm|which|install|repair) (( ${#ids} )) && compadd -X 'agent' -- $ids ;;
       history|hist|sessions)
         compadd -X '选项' -- --json --cwd --limit --refresh
+        (( ${#ids} )) && compadd -X 'agent' -- $ids ;;
+      profile|profiles)
+        compadd -X '操作' -- ls show add rm
         (( ${#ids} )) && compadd -X 'agent' -- $ids ;;
       validate) compadd -X '选项' -- --json --strict ;;
       doctor) compadd -X '选项' -- --json --fix --dry-run --yes ;;

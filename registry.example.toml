@@ -376,6 +376,25 @@ resume = ["resume"]
 install = "curl -fsSL https://codewhale.net/install.sh | sh"
 
 # ============================================================
+#  Profiles —— 同一个 agent 的启动预设
+#  用：ag cc@work / ag codex@personal
+#  管：ag profile ls / add / show / rm
+# ============================================================
+
+[[profile]]
+id = "work"
+agent = "cc"
+name = "Claude · 工作"
+args = ["--model", "sonnet"]
+env = { ANTHROPIC_BASE_URL = "${ANTHROPIC_WORK_URL}" }
+
+[[profile]]
+id = "personal"
+agent = "codex"
+name = "Codex · 个人"
+env = { OPENAI_BASE_URL = "${OPENAI_PERSONAL_URL}" }
+
+# ============================================================
 #  多开组合 —— 把常用的「同时开哪几个」存成一个名字
 #
 #  用：    ag team @review          （看有哪些：ag teams）

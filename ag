@@ -55,7 +55,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -243,6 +243,76 @@ def find_team(teams, key):
         if t.id.lower() == k:
             return t
     return None
+
+
+class Profile:
+    """同一个 agent 的一套参数 / 环境变量预设。"""
+
+    __slots__ = ("id", "agent", "name", "desc", "args", "env", "cwd",
+                 "hidden", "raw")
+
+    def __init__(self, d: dict):
+        self.raw = d
+        self.id = str(d.get("id", "")).strip()
+        self.agent = str(d.get("agent", "")).strip()
+        self.name = str(d.get("name", "")).strip()
+        self.desc = str(d.get("desc", "")).strip()
+        self.args = [str(a) for a in d.get("args", [])]
+        self.env = {str(k): str(v) for k, v in d.get("env", {}).items()}
+        self.cwd = str(d.get("cwd", "")).strip()
+        self.hidden = bool(d.get("hidden", False))
+
+    @property
+    def ref(self):
+        return f"{self.agent}@{self.id}"
+
+    def as_entry(self, base: Entry):
+        d = dict(base.raw)
+        d.update({
+            "id": self.ref,
+            "name": self.name or f"{base.name} · {self.id}",
+            "desc": self.desc or base.desc,
+            "args": [*base.args, *self.args],
+            "env": {**base.env, **self.env},
+            "cwd": self.cwd or base.cwd,
+            "hidden": base.hidden or self.hidden,
+            "alias": [],
+        })
+        return Entry(d)
+
+
+def load_profiles(path=None):
+    path = path or REGISTRY
+    if not os.path.exists(path):
+        return []
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    out = []
+    for d in data.get("profile", []):
+        p = Profile(d)
+        if p.id and p.agent:
+            out.append(p)
+    return out
+
+
+def find_profile(profiles, key):
+    k = (key or "").lower()
+    for p in profiles:
+        if p.ref.lower() == k:
+            return p
+    return None
+
+
+def resolve_entry(entries, key):
+    """解析普通 agent 或 agent@profile。"""
+    e = find_entry(entries, key)
+    if e:
+        return e
+    p = find_profile(load_profiles(), key)
+    if not p:
+        return None
+    base = find_entry(entries, p.agent)
+    return p.as_entry(base) if base else None
 
 
 def fuzzy(entries, query):
@@ -537,7 +607,7 @@ def launch_argv(e: Entry, argv, resumed=False):
             print(f"{C['yel']}! 工作目录不存在，保持当前目录：{target}{C['r']}")
 
     env = os.environ.copy()
-    env.update(e.env)
+    env.update({k: os.path.expandvars(v) for k, v in e.env.items()})
 
     # 先记账再 exec —— execvpe 一调用这个进程就没了，之后写不了
     try:
@@ -1956,7 +2026,7 @@ def cmd_ls(entries, args):
 def cmd_which(entries, args):
     if not args:
         return die("用法：ag which <id>")
-    e = find_entry(entries, args[0])
+    e = resolve_entry(entries, args[0])
     if not e:
         return die(f"注册表里没有 「{args[0]}」")
     p = e.resolved()
@@ -1984,7 +2054,7 @@ def cmd_resume(entries, args):
     这里不自己解析会话文件，只把命令转过去，让各家的选择器自己干活。
     """
     if args and not args[0].startswith("-"):
-        e = find_entry(entries, args[0])
+        e = resolve_entry(entries, args[0])
         if not e:
             return die(f"注册表里没有 「{args[0]}」")
         return cmd_launch(e, args[1:], resume=True)
@@ -2023,7 +2093,7 @@ def cmd_last(entries, args):
     if not lid:
         return die("还没有使用记录。先跑一次 ag <id> 就有了")
 
-    e = find_entry(entries, lid)
+    e = resolve_entry(entries, lid)
     if not e:
         return die(f"上次用的是 「{lid}」，但它已经不在注册表里了")
 
@@ -3273,6 +3343,163 @@ def render_toml(e: Entry):
     return "\n".join(L) + "\n"
 
 
+def render_profile_toml(p: Profile):
+    L = ["[[profile]]", f"id = {toml_str(p.id)}",
+         f"agent = {toml_str(p.agent)}"]
+    if p.name:
+        L.append(f"name = {toml_str(p.name)}")
+    if p.desc:
+        L.append(f"desc = {toml_str(p.desc)}")
+    if p.args:
+        L.append(f"args = {toml_arr(p.args)}")
+    if p.env:
+        L.append("env = { " + ", ".join(
+            f"{k} = {toml_str(v)}" for k, v in p.env.items()) + " }")
+    if p.cwd:
+        L.append(f"cwd = {toml_str(p.cwd)}")
+    if p.hidden:
+        L.append("hidden = true")
+    return "\n".join(L) + "\n"
+
+
+def remove_profile_block(ref):
+    with open(REGISTRY, encoding="utf-8") as f:
+        lines = f.readlines()
+    out, block, dropped = [], [], 0
+
+    def flush():
+        nonlocal dropped
+        if not block:
+            return
+        tail = []
+        while len(block) > 1 and (not block[-1].strip()
+                                  or block[-1].lstrip().startswith("#")):
+            tail.insert(0, block.pop())
+        vals = {}
+        for ln in block:
+            s = ln.strip()
+            if s.startswith(("id", "agent")) and "=" in s:
+                k, v = s.split("=", 1)
+                vals[k.strip()] = v.strip().strip("\"'")
+        got = f"{vals.get('agent', '')}@{vals.get('id', '')}"
+        if got.lower() == ref.lower():
+            dropped += 1
+        else:
+            out.extend(block)
+        out.extend(tail)
+
+    for ln in lines:
+        ls = ln.lstrip()
+        if ls.startswith("[[profile]]"):
+            flush()
+            block = [ln]
+        elif block and ls.startswith("[["):
+            flush()
+            block = []
+            out.append(ln)
+        elif block:
+            block.append(ln)
+        else:
+            out.append(ln)
+    flush()
+    if not dropped:
+        return 0
+    bk = backup_registry()
+    with open(REGISTRY, "w", encoding="utf-8") as f:
+        f.writelines(out)
+    print(f"  {C['grn']}✓ 已删除 profile {ref}{C['r']}")
+    print(f"  {C['gry']}备份：{bk}{C['r']}")
+    return dropped
+
+
+def cmd_profile(entries, args):
+    profiles = load_profiles()
+    as_json = "--json" in args
+    sub = args[0] if args else "ls"
+    rest = args[1:] if args else []
+
+    if sub in ("ls", "list"):
+        if as_json:
+            print(json.dumps([{
+                "ref": p.ref, "agent": p.agent, "id": p.id,
+                "name": p.name, "desc": p.desc, "args": p.args,
+                "env": p.env, "cwd": p.cwd, "hidden": p.hidden,
+            } for p in profiles], ensure_ascii=False, indent=2))
+            return 0
+        if not profiles:
+            print(f"  {C['gry']}还没有 profile。用 "
+                  f"{C['cyn']}ag profile add --agent cc --id work{C['r']}"
+                  f"{C['gry']} 添加{C['r']}")
+            return 0
+        print(f"\n  {C['b']}Profiles{C['r']}  {C['gry']}{len(profiles)} 个{C['r']}\n")
+        for p in profiles:
+            print(f"  {C['mag']}@{C['r']} {C['b']}{pad(p.ref, 22)}{C['r']} "
+                  f"{C['gry']}{p.name or p.desc or ''}{C['r']}")
+        print(f"\n  {C['gry']}启动：{C['cyn']}ag cc@work{C['r']}\n")
+        return 0
+
+    if sub == "show":
+        ref = rest[0] if rest else ""
+        p = find_profile(profiles, ref)
+        if not p:
+            return die(f"没有 profile 「{ref}」")
+        base = find_entry(entries, p.agent)
+        if not base:
+            return die(f"profile 对应的 agent 不存在：{p.agent}")
+        e = p.as_entry(base)
+        print(f"  ref   : {p.ref}")
+        print(f"  agent : {p.agent}")
+        print(f"  命令  : {' '.join(e.argv())}")
+        if e.env:
+            print(f"  环境  : {e.env}")
+        if e.cwd:
+            print(f"  目录  : {e.cwd}")
+        return 0
+
+    if sub == "add":
+        import argparse
+        ap = argparse.ArgumentParser(prog="ag profile add")
+        ap.add_argument("--agent", required=True)
+        ap.add_argument("--id", required=True)
+        ap.add_argument("--name", default="")
+        ap.add_argument("--desc", default="")
+        ap.add_argument("--args", default="")
+        ap.add_argument("--env", action="append", default=[])
+        ap.add_argument("--cwd", default="")
+        ap.add_argument("--hidden", action="store_true")
+        ns = ap.parse_args(rest)
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", ns.id):
+            return die("profile id 只能包含字母、数字、点、下划线和短横线")
+        if not find_entry(entries, ns.agent):
+            return die(f"注册表里没有 agent 「{ns.agent}」")
+        ref = f"{ns.agent}@{ns.id}"
+        if find_profile(profiles, ref):
+            return die(f"profile 「{ref}」已存在")
+        env = {}
+        for item in ns.env:
+            if "=" not in item:
+                return die(f"--env 需要 K=V：{item}")
+            k, v = item.split("=", 1)
+            env[k] = v
+        p = Profile(dict(id=ns.id, agent=ns.agent, name=ns.name,
+                         desc=ns.desc, args=ns.args.split(),
+                         env=env, cwd=ns.cwd, hidden=ns.hidden))
+        with open(REGISTRY, "a", encoding="utf-8") as f:
+            f.write("\n# ── 由 `ag profile add` 添加 ──\n" + render_profile_toml(p))
+        print(f"  {C['grn']}✓ 已添加 profile {p.ref}{C['r']}")
+        print(f"  {C['gry']}启动：{C['cyn']}ag {p.ref}{C['r']}")
+        return 0
+
+    if sub in ("rm", "remove"):
+        if not rest:
+            return die("用法：ag profile rm <agent@profile>")
+        if not remove_profile_block(rest[0]):
+            return die(f"没有 profile 「{rest[0]}」")
+        return 0
+
+    return die("用法：ag profile [ls|show|add|rm]")
+
+
 def render_team_toml(t: Team):
     L = ["[[team]]", f"id = {toml_str(t.id)}"]
     if t.name and t.name != t.id:
@@ -3434,7 +3661,7 @@ def cmd_scan(entries, args):
 RESERVED_COMMANDS = set("""
 ls list add rm remove edit scan validate doctor repair install which resume r
 last l pin unpin stats update upgrade up outdated old search find s handoff ho
-team teams multi attach ps kill stop path help
+team teams multi attach ps kill stop path help profile profiles
 """.split())
 
 AGENT_FIELDS = {
@@ -3442,6 +3669,7 @@ AGENT_FIELDS = {
     "install", "update", "resume", "resume_session", "sessions", "group", "hidden",
 }
 TEAM_FIELDS = {"id", "name", "desc", "agents", "layout", "grid", "resume", "session"}
+PROFILE_FIELDS = {"id", "agent", "name", "desc", "args", "env", "cwd", "hidden"}
 
 
 def _issue(level, code, subject, message):
@@ -3471,6 +3699,7 @@ def validate_registry():
             "registry": REGISTRY,
             "agents": 0,
             "teams": 0,
+            "profiles": 0,
             "issues": issues,
         }
 
@@ -3485,17 +3714,22 @@ def validate_registry():
             "registry": REGISTRY,
             "agents": 0,
             "teams": 0,
+            "profiles": 0,
             "issues": issues,
         }
 
     raw_agents = data.get("agent", [])
     raw_teams = data.get("team", [])
+    raw_profiles = data.get("profile", [])
     if not isinstance(raw_agents, list):
         err("agents_invalid", "agent", "[[agent]] 必须是数组")
         raw_agents = []
     if not isinstance(raw_teams, list):
         err("teams_invalid", "team", "[[team]] 必须是数组")
         raw_teams = []
+    if not isinstance(raw_profiles, list):
+        err("profiles_invalid", "profile", "[[profile]] 必须是数组")
+        raw_profiles = []
 
     id_owner = {}
     name_owner = {}
@@ -3604,12 +3838,49 @@ def validate_registry():
             if key not in TEAM_FIELDS:
                 warn("unknown_field", subject, f"未知字段「{key}」")
 
+    profile_refs = set()
+    for i, p in enumerate(raw_profiles, 1):
+        if not isinstance(p, dict):
+            err("profile_invalid", f"profile[{i}]", "profile 必须是表")
+            continue
+        pid = str(p.get("id", "")).strip()
+        agent = str(p.get("agent", "")).strip()
+        subject = f"{agent}@{pid}" if agent and pid else f"profile[{i}]"
+        if not pid:
+            err("profile_id_missing", subject, "缺少 profile id")
+        elif not re.fullmatch(r"[A-Za-z0-9._-]+", pid):
+            err("profile_id_invalid", subject,
+                "profile id 只能包含字母、数字、点、下划线和短横线")
+        if not agent:
+            err("profile_agent_missing", subject, "缺少 agent")
+        elif agent.lower() not in known_agents:
+            err("profile_agent_missing", subject, f"agent「{agent}」不存在")
+        ref = subject.lower()
+        if pid and agent:
+            if ref in profile_refs:
+                err("profile_duplicate", subject, "profile 重复")
+            profile_refs.add(ref)
+        for key in p:
+            if key not in PROFILE_FIELDS:
+                warn("unknown_field", subject, f"未知字段「{key}」")
+        for key in ("args",):
+            if key in p and not _string_list(p[key]):
+                err(f"{key}_invalid", subject, f"{key} 必须是字符串数组")
+        if "env" in p and not isinstance(p["env"], dict):
+            err("env_invalid", subject, "env 必须是表")
+        for key in ("name", "desc", "cwd"):
+            if key in p and not isinstance(p[key], str):
+                err(f"{key}_invalid", subject, f"{key} 必须是字符串")
+        if "hidden" in p and not isinstance(p["hidden"], bool):
+            warn("hidden_invalid", subject, "hidden 应为 true/false")
+
     return {
         "schema_version": 1,
         "ag_version": VERSION,
         "registry": REGISTRY,
         "agents": len(raw_agents),
         "teams": len(raw_teams),
+        "profiles": len(raw_profiles),
         "issues": issues,
     }
 
@@ -3632,6 +3903,7 @@ def cmd_validate(args):
         "warnings": len(warnings),
         "agents": report["agents"],
         "teams": report["teams"],
+        "profiles": report["profiles"],
     }
 
     if as_json:
@@ -3642,7 +3914,8 @@ def cmd_validate(args):
           f"{C['gry']}注册表：{REGISTRY}{C['r']}\n")
     if not report["issues"]:
         print(f"  {C['grn']}✓ 注册表有效：{report['agents']} 个 agent"
-              f" · {report['teams']} 个 team{C['r']}\n")
+              f" · {report['teams']} 个 team"
+              f" · {report['profiles']} 个 profile{C['r']}\n")
         return 0
 
     for item in report["issues"]:
@@ -3920,6 +4193,9 @@ def usage():
     ag ls --json          机器可读，方便接别的脚本
     ag add                向导式添加新 agent
     ag add --id x --cmd y --desc "..." --tags a,b --install "..."
+    ag profile ls         列出 agent profiles（如 cc@work）
+    ag profile add --agent cc --id work --args "--model ..."
+    ag profile rm cc@work 删除 profile
     ag rm <id> [id...]   删除（可一次删多条，注释保留）
     ag edit               用 $EDITOR 打开注册表
     ag scan               扫描 PATH，发现装了但没登记的 agent
@@ -3972,6 +4248,7 @@ def main(argv):
            "update": cmd_update, "upgrade": cmd_update, "up": cmd_update,
            "outdated": cmd_outdated, "old": cmd_outdated,
            "history": cmd_history, "hist": cmd_history, "sessions": cmd_history,
+           "profile": cmd_profile, "profiles": cmd_profile,
            "search": cmd_search, "find": cmd_search, "s": cmd_search,
            "handoff": cmd_handoff, "ho": cmd_handoff,
            "team": cmd_team, "teams": cmd_teams, "multi": cmd_team,
@@ -3996,7 +4273,7 @@ def main(argv):
         return cmd_launch(picked[0], [], resume=(action == "resume"))
 
     # 有参数 → 先精确匹配 id/alias
-    e = find_entry(entries, a[0])
+    e = resolve_entry(entries, a[0])
     if e:
         return cmd_launch(e, a[1:])
 
