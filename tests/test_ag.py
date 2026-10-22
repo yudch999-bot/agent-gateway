@@ -324,6 +324,111 @@ check("续聊命令没有重复参数", not dupes, "; ".join(dupes))
 say(f"  · 可续聊的 agent: {sum(1 for x in reg if x.can_resume)}/{len(reg)}")
 
 say()
+say("8.5) ag validate —— 静态注册表检查")
+VAL_DIR = tempfile.mkdtemp(prefix="ag-validate-")
+VAL_BAD = os.path.join(VAL_DIR, "bad.toml")
+VAL_WARN = os.path.join(VAL_DIR, "warn.toml")
+VAL_BROKEN = os.path.join(VAL_DIR, "broken.toml")
+with open(VAL_BAD, "w", encoding="utf-8") as fh:
+    fh.write(f'''
+[[agent]]
+id = "ok"
+name = "正常"
+cmd = "echo"
+alias = ["doctor"]
+sessions = "{os.path.join(VAL_DIR, "no-sessions")}"
+mystery = "x"
+
+[[agent]]
+id = "ok"
+name = "重复 id"
+cmd = ""
+
+[[agent]]
+id = "doctor"
+name = "撞子命令"
+cmd = "echo"
+
+[[agent]]
+id = "a"
+name = "A"
+cmd = "echo"
+alias = ["b"]
+
+[[agent]]
+id = "b"
+name = "B"
+cmd = "echo"
+
+[[team]]
+id = "bad-team"
+agents = ["missing"]
+layout = "wat"
+grid = "wat"
+extra = true
+''')
+with open(VAL_WARN, "w", encoding="utf-8") as fh:
+    fh.write(f'''
+[[agent]]
+id = "warn"
+name = "只有警告"
+cmd = "echo"
+sessions = "{os.path.join(VAL_DIR, "missing-dir")}"
+''')
+with open(VAL_BROKEN, "w", encoding="utf-8") as fh:
+    fh.write("[[agent]\n")
+
+def vrun(args):
+    buf = io.StringIO()
+    saved = ag.sys.stdout, ag.sys.argv
+    ag.sys.stdout, ag.sys.argv = buf, ["ag", *args]
+    try:
+        rc = ag.main(ag.sys.argv)
+    finally:
+        ag.sys.stdout, ag.sys.argv = saved
+    return rc, buf.getvalue()
+
+saved_reg = ag.REGISTRY
+try:
+    ag.REGISTRY = VAL_BAD
+    rc, o = vrun(["validate", "--json"])
+    data = json.loads(o)
+    codes = {x["code"] for x in data["issues"]}
+    check("validate --json 合法且失败", rc == 1 and data["ok"] is False, o[:300])
+    check("抓到重复 id / 空 cmd",
+          {"id_duplicate", "cmd_missing"} <= codes, str(codes))
+    check("抓到保留名 / 重复名称",
+          {"alias_reserved", "id_reserved", "name_duplicate"} <= codes, str(codes))
+    check("抓到未知字段 / sessions 警告",
+          {"unknown_field", "sessions_missing"} <= codes, str(codes))
+    check("抓到 team 成员 / 布局 / 网格问题",
+          {"team_agent_missing", "team_layout_invalid", "team_grid_invalid"} <= codes,
+          str(codes))
+    check("summary 计数一致",
+          data["summary"]["errors"] == sum(1 for x in data["issues"]
+                                           if x["level"] == "error")
+          and data["summary"]["warnings"] == sum(1 for x in data["issues"]
+                                                 if x["level"] == "warning"),
+          str(data["summary"]))
+
+    ag.REGISTRY = VAL_WARN
+    rc, o = vrun(["validate", "--json"])
+    data = json.loads(o)
+    check("只有 warning 时默认成功", rc == 0 and data["ok"] is True, o[:300])
+    rc, o = vrun(["validate", "--json", "--strict"])
+    data = json.loads(o)
+    check("--strict 让 warning 失败", rc == 1 and data["ok"] is False, o[:300])
+
+    ag.REGISTRY = VAL_BROKEN
+    rc, o = vrun(["validate", "--json"])
+    data = json.loads(o)
+    check("坏 TOML 也能输出 JSON",
+          rc == 1 and data["issues"][0]["code"] == "toml_invalid", o[:300])
+finally:
+    ag.REGISTRY = saved_reg
+    shutil.rmtree(VAL_DIR, ignore_errors=True)
+
+say()
 say("9) frecency 使用频率评分")
 NOW = 1_800_000_000.0
 u = {"hot": [NOW - 3600, NOW - 7200, NOW - 10800],     # 今天用了 3 次

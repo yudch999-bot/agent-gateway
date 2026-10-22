@@ -55,7 +55,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -2999,6 +2999,222 @@ def cmd_scan(entries, args):
     return 0
 
 
+RESERVED_COMMANDS = set("""
+ls list add rm remove edit scan validate doctor repair install which resume r
+last l pin unpin stats update upgrade up outdated old search find s handoff ho
+team teams multi attach ps kill stop path help
+""".split())
+
+AGENT_FIELDS = {
+    "id", "name", "cmd", "args", "desc", "tags", "alias", "env", "cwd",
+    "install", "update", "resume", "sessions", "group", "hidden",
+}
+TEAM_FIELDS = {"id", "name", "desc", "agents", "layout", "grid", "resume", "session"}
+
+
+def _issue(level, code, subject, message):
+    return {"level": level, "code": code, "subject": subject, "message": message}
+
+
+def _string_list(value):
+    return (isinstance(value, list)
+            and all(isinstance(x, str) for x in value))
+
+
+def validate_registry():
+    """静态检查注册表本身，不依赖当前机器是否装了对应命令。"""
+    issues = []
+
+    def err(code, subject, message):
+        issues.append(_issue("error", code, subject, message))
+
+    def warn(code, subject, message):
+        issues.append(_issue("warning", code, subject, message))
+
+    if not os.path.exists(REGISTRY):
+        err("registry_missing", REGISTRY, "注册表不存在")
+        return {
+            "schema_version": 1,
+            "ag_version": VERSION,
+            "registry": REGISTRY,
+            "agents": 0,
+            "teams": 0,
+            "issues": issues,
+        }
+
+    try:
+        with open(REGISTRY, "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as ex:
+        err("toml_invalid", REGISTRY, f"TOML 解析失败：{ex}")
+        return {
+            "schema_version": 1,
+            "ag_version": VERSION,
+            "registry": REGISTRY,
+            "agents": 0,
+            "teams": 0,
+            "issues": issues,
+        }
+
+    raw_agents = data.get("agent", [])
+    raw_teams = data.get("team", [])
+    if not isinstance(raw_agents, list):
+        err("agents_invalid", "agent", "[[agent]] 必须是数组")
+        raw_agents = []
+    if not isinstance(raw_teams, list):
+        err("teams_invalid", "team", "[[team]] 必须是数组")
+        raw_teams = []
+
+    id_owner = {}
+    name_owner = {}
+    known_agents = {}
+    for i, d in enumerate(raw_agents, 1):
+        if not isinstance(d, dict):
+            err("agent_invalid", f"agent[{i}]", "agent 必须是表")
+            continue
+        eid = str(d.get("id", "")).strip()
+        subject = eid or f"agent[{i}]"
+        if not eid:
+            err("id_missing", subject, "缺少 id")
+        if not str(d.get("cmd", "")).strip():
+            err("cmd_missing", subject, "缺少 cmd")
+        if eid:
+            key = eid.lower()
+            if key in id_owner:
+                err("id_duplicate", subject, f"id 与「{id_owner[key]}」重复")
+            else:
+                id_owner[key] = eid
+            known_agents[key] = eid
+            if key in RESERVED_COMMANDS:
+                err("id_reserved", subject, f"id 与子命令「{eid}」冲突")
+
+        aliases = d.get("alias", [])
+        if not _string_list(aliases):
+            err("alias_invalid", subject, "alias 必须是字符串数组")
+            aliases = []
+        names = [eid] + [str(a).strip() for a in aliases if str(a).strip()]
+        for idx, name in enumerate(names):
+            key = name.lower()
+            if not key:
+                continue
+            if idx > 0 and key in RESERVED_COMMANDS:
+                err("alias_reserved", subject, f"别名「{name}」与子命令冲突")
+            owner = name_owner.get(key)
+            if owner and owner != eid:
+                err("name_duplicate", subject, f"名称「{name}」已被「{owner}」占用")
+            else:
+                name_owner[key] = eid
+        for a in aliases:
+            known_agents[str(a).strip().lower()] = eid
+
+        for key in d:
+            if key not in AGENT_FIELDS:
+                warn("unknown_field", subject, f"未知字段「{key}」")
+        for key in ("args", "tags", "resume"):
+            if key in d and not _string_list(d[key]):
+                err(f"{key}_invalid", subject, f"{key} 必须是字符串数组")
+        if "env" in d and not isinstance(d["env"], dict):
+            err("env_invalid", subject, "env 必须是表")
+        for key in ("install", "update"):
+            if key in d and not isinstance(d[key], str):
+                err(f"{key}_invalid", subject, f"{key} 必须是字符串")
+        if "hidden" in d and not isinstance(d["hidden"], bool):
+            warn("hidden_invalid", subject, "hidden 应为 true/false")
+
+        sessions = str(d.get("sessions", "")).strip()
+        if sessions:
+            p = os.path.expanduser(sessions)
+            if not os.path.isdir(p):
+                warn("sessions_missing", subject, f"sessions 目录不存在：{sessions}")
+        cwd = str(d.get("cwd", "")).strip()
+        if cwd:
+            p = os.path.expanduser(cwd)
+            if not os.path.isdir(p):
+                warn("cwd_missing", subject, f"cwd 目录不存在：{cwd}")
+
+    team_ids = set()
+    for i, t in enumerate(raw_teams, 1):
+        if not isinstance(t, dict):
+            err("team_invalid", f"team[{i}]", "team 必须是表")
+            continue
+        tid = str(t.get("id", "")).strip()
+        subject = "@" + tid if tid else f"team[{i}]"
+        if not tid:
+            err("team_id_missing", subject, "缺少 team id")
+        elif tid.lower() in team_ids:
+            err("team_id_duplicate", subject, "team id 重复")
+        else:
+            team_ids.add(tid.lower())
+        members = t.get("agents", [])
+        if not _string_list(members) or not members:
+            err("team_agents_invalid", subject, "agents 必须是非空字符串数组")
+            members = []
+        for member in members:
+            key = str(member).strip().lower()
+            if key not in known_agents:
+                err("team_agent_missing", subject,
+                    f"成员「{member}」不在 agent 注册表里")
+        layout = t.get("layout")
+        if layout not in (None, "", "grid", "windows"):
+            warn("team_layout_invalid", subject,
+                 f"layout「{layout}」不认识，将按 grid 处理")
+        if "grid" in t and t["grid"] and parse_grid(str(t["grid"])) is None:
+            warn("team_grid_invalid", subject,
+                 f"grid「{t['grid']}」不认识，将自动计算")
+        for key in t:
+            if key not in TEAM_FIELDS:
+                warn("unknown_field", subject, f"未知字段「{key}」")
+
+    return {
+        "schema_version": 1,
+        "ag_version": VERSION,
+        "registry": REGISTRY,
+        "agents": len(raw_agents),
+        "teams": len(raw_teams),
+        "issues": issues,
+    }
+
+
+def cmd_validate(args):
+    as_json = "--json" in args
+    strict = "--strict" in args
+    unknown = [a for a in args if a not in ("--json", "--strict")]
+    if unknown:
+        return die("用法：ag validate [--json] [--strict]")
+
+    report = validate_registry()
+    errors = [x for x in report["issues"] if x["level"] == "error"]
+    warnings = [x for x in report["issues"] if x["level"] == "warning"]
+    ok = not errors and not (strict and warnings)
+    report["strict"] = strict
+    report["ok"] = ok
+    report["summary"] = {
+        "errors": len(errors),
+        "warnings": len(warnings),
+        "agents": report["agents"],
+        "teams": report["teams"],
+    }
+
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+
+    print(f"\n  {C['b']}ag validate{C['r']}  "
+          f"{C['gry']}注册表：{REGISTRY}{C['r']}\n")
+    if not report["issues"]:
+        print(f"  {C['grn']}✓ 注册表有效：{report['agents']} 个 agent"
+              f" · {report['teams']} 个 team{C['r']}\n")
+        return 0
+
+    for item in report["issues"]:
+        icon = f"{C['red']}✗{C['r']}" if item["level"] == "error" else f"{C['yel']}!{C['r']}"
+        print(f"  {icon} {C['b']}{pad(item['code'], 22)}{C['r']} "
+              f"{C['gry']}{item['subject']}{C['r']}  {item['message']}")
+    print(f"\n  {C['gry']}{len(errors)} errors · {len(warnings)} warnings"
+          f"{' · strict' if strict else ''}{C['r']}\n")
+    return 0 if ok else 1
+
+
 def doctor_report(entries):
     """生成稳定的机器可读体检结果。"""
     items = []
@@ -3265,6 +3481,7 @@ def usage():
     ag rm <id> [id...]   删除（可一次删多条，注释保留）
     ag edit               用 $EDITOR 打开注册表
     ag scan               扫描 PATH，发现装了但没登记的 agent
+    ag validate           静态检查注册表（--json / --strict）
     ag doctor             体检：哪些能跑、哪些缺
     ag doctor --json      机器可读的体检结果
     ag repair             修复缺失项（默认先确认，--dry-run 预览）
@@ -3284,12 +3501,14 @@ def usage():
 # ---------------------------------------------------------------- main
 
 def main(argv):
+    a = argv[1:]
+    if a and a[0] == "validate":
+        return cmd_validate(a[1:])
     if not os.path.exists(REGISTRY):
         os.makedirs(AG_DIR, exist_ok=True)
         open(REGISTRY, "w").write("# ag registry\n")
 
     entries = load_registry()
-    a = argv[1:]
 
     if a and a[0] in ("-h", "--help", "help"):
         return usage()
