@@ -55,7 +55,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -2294,6 +2294,364 @@ def short_cwd(cwd):
     return c
 
 
+HISTORY_CACHE_VERSION = 1
+HISTORY_MAX_SCAN = 1000
+
+
+def history_cache_path():
+    return os.path.join(os.path.dirname(REGISTRY), "sessions-index.json")
+
+
+def load_history_cache():
+    try:
+        with open(history_cache_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if (data.get("version") == HISTORY_CACHE_VERSION
+                and isinstance(data.get("files"), dict)):
+            return data
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {"version": HISTORY_CACHE_VERSION, "files": {}}
+
+
+def save_history_cache(cache):
+    path = history_cache_path()
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def history_rows(entries, refresh=False, max_scan=HISTORY_MAX_SCAN):
+    """扫描最近会话并返回带元信息的行；按 mtime 增量缓存。"""
+    cache = {"version": HISTORY_CACHE_VERSION, "files": {}} if refresh \
+        else load_history_cache()
+    candidates, seen = [], set()
+    for e in entries:
+        if e.hidden or not e.sessions:
+            continue
+        for path in session_files(e):
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            seen.add(real)
+            candidates.append((st.st_mtime, st.st_size, e, path, real))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    rows = []
+    for mtime, size, e, path, real in candidates[:max_scan]:
+        meta = cache["files"].get(real)
+        if (not meta or meta.get("mtime") != mtime
+                or meta.get("size") != size):
+            raw = session_meta(path, max_lines=120)
+            meta = {
+                "mtime": mtime,
+                "size": size,
+                "cwd": raw.get("cwd"),
+                "title": raw.get("title"),
+                "ts": raw.get("ts"),
+            }
+            cache["files"][real] = meta
+        rows.append({
+            "agent": e.id,
+            "name": e.name,
+            "path": path,
+            "cwd": meta.get("cwd"),
+            "title": meta.get("title"),
+            "mtime": mtime,
+            "timestamp": meta.get("ts"),
+            "can_resume": e.can_resume,
+        })
+    save_history_cache(cache)
+    return rows
+
+
+def history_match(row, query):
+    tokens = query.lower().split()
+    if not tokens:
+        return True
+    hay = " ".join([
+        str(row.get("agent") or ""),
+        str(row.get("name") or ""),
+        str(row.get("cwd") or ""),
+        str(row.get("title") or ""),
+        str(row.get("path") or ""),
+    ]).lower()
+    return all(t in hay for t in tokens)
+
+
+def history_when(row):
+    return fmt_session_time(row.get("timestamp")) or human_age(row["mtime"])
+
+
+def print_history(rows, limit=50):
+    shown = rows if limit == 0 else rows[:limit]
+    print(f"\n  {C['b']}ag history{C['r']}  "
+          f"{C['gry']}{len(shown)}/{len(rows)} 个会话{C['r']}\n")
+    for row in shown:
+        mark = f"{C['mag']}↻{C['r']}" if row["can_resume"] else " "
+        print(f"  {mark} {C['b']}{pad(row['agent'], 10)}{C['r']} "
+              f"{C['gry']}{history_when(row):>10}{C['r']}  "
+              f"{C['cyn']}{trunc(short_cwd(row.get('cwd')), 30)}{C['r']}")
+        title = row.get("title") or os.path.basename(row["path"])
+        print(f"       {C['gry']}{trunc(title, 84)}{C['r']}")
+    if rows:
+        print(f"\n  {C['gry']}交互选择：{C['cyn']}ag history{C['r']}"
+              f"{C['gry']}  ·  只看某家：{C['cyn']}ag history codex{C['r']}"
+              f"{C['gry']}  ·  刷新索引：{C['cyn']}ag history --refresh{C['r']}\n")
+    return 0
+
+
+def history_picker(rows):
+    """全屏会话选择器。返回 (row, action) 或 (None, None)。"""
+    if not rows or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None, None
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+
+    def restore():
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?1049l\033[?25h")
+        sys.stdout.flush()
+
+    def enter_alt():
+        tty.setraw(fd)
+        sys.stdout.write("\033[?1049h\033[?25l")
+        sys.stdout.flush()
+
+    def read_key():
+        b = os.read(fd, 1)
+        if not b:
+            return "EOF"
+        if b == b"\x1b":
+            r, _, _ = select.select([fd], [], [], 0.03)
+            if not r:
+                return "ESC"
+            seq = os.read(fd, 1)
+            if seq in (b"[", b"O"):
+                while True:
+                    r, _, _ = select.select([fd], [], [], 0.03)
+                    if not r:
+                        break
+                    c = os.read(fd, 1)
+                    if not c:
+                        return "EOF"
+                    seq += c
+                    if c.isalpha() or c == b"~":
+                        break
+                return {b"[A": "UP", b"[B": "DOWN", b"[H": "HOME",
+                        b"[F": "END", b"[5~": "PGUP", b"[6~": "PGDN"}.get(seq, "UNK")
+            return "ESC"
+        if b in (b"\r", b"\n"):
+            return "ENTER"
+        if b in (b"\x7f", b"\x08"):
+            return "BACKSPACE"
+        if b == b"\x03":
+            return "ESC"
+        if b == b"\x0f":
+            return "HANDOFF"
+        if b == b"\x10":
+            return "UP"
+        if b == b"\x0e":
+            return "DOWN"
+        if b[0] >= 0x80:
+            need = 2 if b[0] >> 5 == 0b110 else 3 if b[0] >> 4 == 0b1110 else 4
+            buf = b
+            while len(buf) < need:
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if not r:
+                    break
+                buf += os.read(fd, 1)
+            return buf.decode("utf-8", "ignore")
+        return b.decode("utf-8", "ignore")
+
+    query, cursor, flash = "", 0, ""
+    try:
+        enter_alt()
+        while True:
+            items = [r for r in rows if history_match(r, query)]
+            if cursor >= len(items):
+                cursor = max(0, len(items) - 1)
+            W, H = shutil.get_terminal_size((100, 24))
+            list_h = max(5, H - 7)
+            top = max(0, min(cursor - list_h // 2,
+                             max(0, len(items) - list_h)))
+            shown = items[top:top + list_h]
+            out = ["\033[H\033[2J"]
+            out.append(f"  {C['b']}{C['mag']}ag history{C['r']}  "
+                       f"{C['gry']}{len(items)}/{len(rows)} 个会话 · 输入筛选{C['r']}\r\n")
+            out.append(f"  {C['cyn']}❯{C['r']} {C['b']}{query}{C['r']}\r\n")
+            out.append(f"  {C['gry']}{'─' * min(W - 4, 96)}{C['r']}\r\n")
+            if not items:
+                out.append(f"\r\n  {C['yel']}没有匹配的会话{C['r']}\r\n")
+            for i, row in enumerate(shown):
+                idx = top + i
+                mark = f"{C['mag']}↻{C['r']}" if row["can_resume"] else " "
+                title = row.get("title") or os.path.basename(row["path"])
+                cwd = short_cwd(row.get("cwd"))
+                if idx == cursor:
+                    line = (f"{C['inv']}  {mark} {C['b']}{pad(row['agent'], 10)}"
+                            f"{C['r']}{C['inv']} {history_when(row):>10}  "
+                            f"{trunc(cwd, 28)}  {trunc(title, max(20, W - 60))}"
+                            f"{C['r']}")
+                else:
+                    line = (f"  {mark} {C['b']}{pad(row['agent'], 10)}{C['r']} "
+                            f"{C['gry']}{history_when(row):>10}  "
+                            f"{C['cyn']}{trunc(cwd, 28)}{C['r']}  "
+                            f"{C['gry']}{trunc(title, max(20, W - 60))}{C['r']}")
+                out.append(line + "\r\n")
+            out.append(f"  {C['gry']}{'─' * min(W - 4, 96)}{C['r']}\r\n")
+            if items:
+                row = items[cursor]
+                out.append(f"  {C['gry']}{trunc(short_home(row['path']), W - 6)}"
+                           f"{C['r']}\r\n")
+            if flash:
+                out.append(f"  {C['yel']}{flash}{C['r']}\r\n")
+                flash = ""
+            else:
+                out.append(f"  {C['gry']}↑↓ 移动 · Enter 续聊 · "
+                           f"Ctrl-O 交接 · 输入筛选 · Esc 退出{C['r']}\r\n")
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+
+            k = read_key()
+            if k in ("ESC", "EOF"):
+                return None, None
+            if k == "ENTER":
+                if not items:
+                    continue
+                row = items[cursor]
+                if not row["can_resume"]:
+                    flash = f"{row['agent']} 没登记 resume；按 Ctrl-O 生成交接"
+                    continue
+                return row, "resume"
+            if k == "HANDOFF":
+                if items:
+                    return items[cursor], "handoff"
+            elif k == "UP":
+                cursor = max(0, cursor - 1)
+            elif k == "DOWN":
+                cursor = min(len(items) - 1, cursor + 1)
+            elif k == "PGUP":
+                cursor = max(0, cursor - list_h)
+            elif k == "PGDN":
+                cursor = min(max(0, len(items) - 1), cursor + list_h)
+            elif k == "HOME":
+                cursor = 0
+            elif k == "END":
+                cursor = max(0, len(items) - 1)
+            elif k == "BACKSPACE":
+                query = query[:-1]
+                cursor = 0
+            elif len(k) == 1:
+                query += k
+                cursor = 0
+    finally:
+        restore()
+
+
+def launch_history_row(entries, row):
+    e = find_entry(entries, row["agent"])
+    if not e:
+        return die(f"会话对应的 agent 已不在注册表：{row['agent']}")
+    old_cwd = e.cwd
+    cwd = row.get("cwd")
+    if cwd and os.path.isdir(os.path.expanduser(cwd)):
+        e.cwd = cwd
+    try:
+        print(f"  {C['gry']}从 {short_cwd(cwd)} 继续；"
+              f"具体会话由 {e.id} 自己选择{C['r']}")
+        return cmd_launch(e, [], resume=True)
+    finally:
+        e.cwd = old_cwd
+
+
+def cmd_history(entries, args):
+    as_json = "--json" in args
+    refresh = "--refresh" in args
+    limit, cwd_filter, agent = 50, None, None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--json", "--refresh"):
+            i += 1
+            continue
+        if a.startswith("--limit="):
+            try:
+                limit = max(0, int(a.split("=", 1)[1]))
+            except ValueError:
+                return die("--limit 需要整数")
+            i += 1
+            continue
+        if a == "--limit" and i + 1 < len(args):
+            try:
+                limit = max(0, int(args[i + 1]))
+            except ValueError:
+                return die("--limit 需要整数")
+            i += 2
+            continue
+        if a.startswith("--cwd="):
+            cwd_filter = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a == "--cwd" and i + 1 < len(args):
+            cwd_filter = args[i + 1]
+            i += 2
+            continue
+        if not a.startswith("-") and agent is None:
+            agent = a
+            i += 1
+            continue
+        return die("用法：ag history [id] [--cwd=路径] [--limit=N] "
+                   "[--json] [--refresh]")
+
+    if agent:
+        e = find_entry(entries, agent)
+        if not e:
+            return die(f"注册表里没有 「{agent}」")
+        roots = [e]
+    else:
+        roots = [e for e in entries if e.sessions and not e.hidden]
+    if not roots:
+        return die("没有任何 agent 登记了 sessions 目录")
+
+    rows = history_rows(roots, refresh=refresh)
+    if cwd_filter:
+        needle = cwd_filter.lower()
+        rows = [r for r in rows if needle in str(r.get("cwd") or "").lower()]
+    if not rows:
+        print(f"  {C['yel']}没有找到会话。{C['r']}")
+        return 0
+
+    if as_json:
+        selected = rows if limit == 0 else rows[:limit]
+        print(json.dumps(selected, ensure_ascii=False, indent=2))
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return print_history(rows, limit)
+
+    row, action = history_picker(rows if limit == 0 else rows[:limit])
+    if not row:
+        return 0
+    if action == "handoff":
+        return cmd_handoff(entries, [row["agent"], "--session", row["path"]])
+    if action == "resume":
+        return launch_history_row(entries, row)
+    return 0
+
+
 def cmd_search(entries, args):
     """在历史会话里搜关键词。"""
     kw = " ".join(a for a in args if not a.startswith("-"))
@@ -2413,12 +2771,26 @@ def cmd_handoff(entries, args):
     场景：在 Claude Code 里聊到一半，想换 Codex 接着干。
     """
     src_id = None
+    session_path = None
     rest = []
-    for a in args:
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--session", "-S"):
+            if i + 1 >= len(args):
+                return die("--session 后面需要会话文件路径")
+            session_path = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--session="):
+            session_path = a.split("=", 1)[1]
+            i += 1
+            continue
         if not a.startswith("-") and src_id is None and find_entry(entries, a):
             src_id = a
         else:
             rest.append(a)
+        i += 1
 
     if src_id:
         e = find_entry(entries, src_id)
@@ -2431,22 +2803,33 @@ def cmd_handoff(entries, args):
     if not e.sessions:
         return die(f"「{e.id}」没有登记 sessions 目录，读不到它的会话历史")
 
-    files = sorted(session_files(e), key=os.path.getmtime, reverse=True)
-    if not files:
-        return die(f"在 {e.sessions} 里没找到任何会话文件")
+    if session_path:
+        root = os.path.realpath(os.path.expanduser(e.sessions))
+        path = os.path.realpath(os.path.expanduser(session_path))
+        if path != root and not path.startswith(root + os.sep):
+            return die("--session 指向的文件不在该 agent 的 sessions 目录里")
+        if not os.path.exists(path):
+            return die(f"会话文件不存在：{session_path}")
+        tail, tried = session_tail(path, turns=8), 1
+        if not tail:
+            return die("这个会话里没找到可提取的对话")
+    else:
+        files = sorted(session_files(e), key=os.path.getmtime, reverse=True)
+        if not files:
+            return die(f"在 {e.sessions} 里没找到任何会话文件")
 
-    # 最近的那个未必有内容（可能只是个自动化的空跑），往前多试几个
-    path, tail, tried = None, [], 0
-    for cand in files[:8]:
-        tried += 1
-        got = session_tail(cand, turns=8)
-        if got:
-            path, tail = cand, got
-            break
-    if not path:
-        return die(f"最近 {tried} 个会话里都没找到可提取的对话"
-                   f"（可能是自动化跑的空会话）。换个 agent 试试，"
-                   f"或用 ag search 找找看")
+        # 最近的那个未必有内容（可能只是个自动化的空跑），往前多试几个
+        path, tail, tried = None, [], 0
+        for cand in files[:8]:
+            tried += 1
+            got = session_tail(cand, turns=8)
+            if got:
+                path, tail = cand, got
+                break
+        if not path:
+            return die(f"最近 {tried} 个会话里都没找到可提取的对话"
+                       f"（可能是自动化跑的空会话）。换个 agent 试试，"
+                       f"或用 ag search 找找看")
 
     meta = session_meta(path, max_lines=120)
     cwd = meta.get("cwd") or os.getcwd()
@@ -3464,6 +3847,9 @@ def usage():
     ag stats [--history]  使用统计 / 最近启动时间线
 
   {C['b']}翻历史{C['r']}
+    ag history [id]        浏览最近会话（输入筛选，Enter 续聊，Ctrl-O 交接）
+    ag history --json      机器可读会话列表
+    ag history --refresh   重建会话索引
     ag search <关键词>     在历史会话里搜（需要注册表登记 sessions 目录）
     ag handoff [id]       把最近一次会话整理成交接 prompt，复制到剪贴板
 
@@ -3529,6 +3915,7 @@ def main(argv):
            "stats": cmd_stats,
            "update": cmd_update, "upgrade": cmd_update, "up": cmd_update,
            "outdated": cmd_outdated, "old": cmd_outdated,
+           "history": cmd_history, "hist": cmd_history, "sessions": cmd_history,
            "search": cmd_search, "find": cmd_search, "s": cmd_search,
            "handoff": cmd_handoff, "ho": cmd_handoff,
            "team": cmd_team, "teams": cmd_teams, "multi": cmd_team,

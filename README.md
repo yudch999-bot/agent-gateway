@@ -17,7 +17,7 @@ Put them all behind one fuzzy picker, and add your own by editing one line.
 | **开哪个** | `ag` / `ag cc` | 十几套启动方式记不住 |
 | **同时开几个** | `ag` 里 Tab 多选 / `ag team` / `ag team @组合名` | 一个不够用，还得手动开窗口 |
 | **接着哪个干** | `ag last` / `ag resume` / `Ctrl-R` | 每次都要重新交代上下文 |
-| **翻旧账 / 搬家** | `ag search` / `ag handoff` | 1.8G 会话历史躺着睡觉 |
+| **翻旧账 / 搬家** | `ag history` / `ag search` / `ag handoff` | 1.8G 会话历史躺着睡觉 |
 | 顺带 | `ag repair` / `ag outdated` / `ag update` / `ag stats` / `ag pin` | 修复、批量运维、看习惯 |
 
 ![demo](docs/demo.gif)
@@ -199,6 +199,9 @@ ag deepseek    →  d
 | `ag unpin <id...>` | 取消置顶 |
 | `ag stats` | 使用统计（含 frecency 柱状图） |
 | `ag stats --history` | 最近启动的时间线 |
+| **`ag history [id]`** | **浏览最近会话，Enter 续聊、Ctrl-O 精确交接** |
+| `ag history --json` | 机器可读会话列表 |
+| `ag history --refresh` | 重建会话索引 |
 | **`ag search <关键词>`** | **在历史会话里搜**（1.8G 的记录不再躺着睡觉） |
 | **`ag handoff [id]`** | **把最近一次会话整理成交接 prompt，复制到剪贴板** |
 | `ag path` | 打印注册表路径 |
@@ -464,6 +467,26 @@ resume = ["session", "--resume"]   # 更长的，如 goose
 装了十几个 agent，历史会话散在十几个私有格式的目录里，加起来 1.8G。
 `ag` 把它们变成能用的东西。
 
+### 浏览
+
+```bash
+ag history              # 跨 agent 浏览最近会话
+ag history codex        # 只看某个 agent
+ag history --cwd=proj   # 按工作目录过滤
+ag history --json       # 给脚本用
+ag history --refresh    # 重建索引
+```
+
+交互里直接打字筛选 `agent / cwd / 标题 / 路径`：
+
+- `Enter`：按该 agent 的续聊方式打开
+- `Ctrl-O`：把选中的**具体会话**生成 handoff prompt
+- `↑↓ / PgUp / PgDn`：移动
+- `Esc`：退出
+
+元数据会缓存在注册表同级的 `sessions-index.json`，只缓存
+`mtime / size / cwd / title`；文件变化后自动增量更新。
+
 ### 搜
 
 ```bash
@@ -491,10 +514,13 @@ ag search 登录页           # 我记得上周让某个 agent 改过，但忘�
 ```bash
 ag handoff          # 从最近用过的 agent 交接
 ag handoff cc       # 指定从 Claude Code 交接
+ag handoff cc --session ~/.claude/projects/.../abc.jsonl   # 精确指定会话
 ```
 
 它会读那个 agent **最近一次会话**的最后 8 轮对话，加上工作目录，
 生成一段 prompt 塞进剪贴板。你切到另一个 agent 粘一下就行。
+
+`--session` 只接受该 agent `sessions` 目录内的文件，不会读任意路径。
 
 场景：在 Claude Code 里聊到一半发现 Codex 更合适，不用把那堆上下文重新讲一遍。
 
@@ -558,7 +584,7 @@ cwd = "~/work"                # 启动目录，支持 ~
 install = "npm i -g myagent"  # 给 `ag install` 用
 update = "npm i -g myagent@latest"   # 给 `ag update` 用（不给就退回 install）
 resume = ["--resume"]         # 续聊参数，给 `ag resume` / Ctrl-R 用
-sessions = "~/.myagent/sessions"     # 会话历史目录，给 `ag search` / `ag handoff` 用
+sessions = "~/.myagent/sessions"     # 会话历史目录，给 history / search / handoff 用
 group = "我的工具"             # 选择器里的分组标题；不填归到「其它」
 hidden = false                # true 则不进选择器
 ```
