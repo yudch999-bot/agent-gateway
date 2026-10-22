@@ -40,7 +40,7 @@ _ag() {
   local t
   for t in $teams; do trefs+=("@$t"); done
   if (( CURRENT == 2 )); then
-    compadd -X '子命令' -- ls add rm edit scan doctor install which path teams team help
+    compadd -X '子命令' -- ls add rm edit scan doctor repair install which path teams team help
     (( ${#ids} )) && compadd -X 'agent（也可直接敲关键词再 Tab）' -- $ids
   else
     case ${words[2]} in
@@ -49,8 +49,10 @@ _ag() {
           (( ${#trefs} )) && compadd -X '组合（@名字）' -- $trefs
           (( ${#ids} )) && compadd -X 'agent' -- $ids
         fi ;;
-      rm|which|install) (( ${#ids} )) && compadd -X 'agent' -- $ids ;;
-      edit|ls|scan|doctor|path) _files ;;
+      rm|which|install|repair) (( ${#ids} )) && compadd -X 'agent' -- $ids ;;
+      doctor) compadd -X '选项' -- --fix --dry-run --yes ;;
+      repair) compadd -X '选项' -- --dry-run --yes ;;
+      edit|ls|scan|path) _files ;;
       *) _files ;;
     esac
   fi

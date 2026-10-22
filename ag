@@ -11,6 +11,7 @@ ag — Agent Gateway
     ag add              向导式添加新 agent
     ag scan             扫描 PATH，发现没登记的 agent
     ag doctor           体检
+    ag repair           修复缺失的 agent（可预览、可确认）
     ag edit             手改注册表
 """
 
@@ -54,7 +55,7 @@ STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -2999,6 +3000,8 @@ def cmd_scan(entries, args):
 
 
 def cmd_doctor(entries, args):
+    if "--fix" in args or "-f" in args:
+        return cmd_repair(entries, [a for a in args if a not in ("--fix", "-f")])
     print(f"\n  {C['b']}ag doctor{C['r']}  {C['gry']}注册表：{REGISTRY}{C['r']}\n")
     bad = 0
     for e in entries:
@@ -3011,8 +3014,124 @@ def cmd_doctor(entries, args):
             print(f"  {C['red']}○{C['r']} {C['b']}{pad(e.id, 16)}{C['r']} {C['red']}未安装{C['r']} "
                   f"{C['gry']}{e.install or 'cmd=' + e.cmd}{C['r']}")
     print(f"\n  {C['gry']}{len(entries) - bad}/{len(entries)} 可用。"
-          f"装缺失的：  ag install <id>   或   ag install --missing{C['r']}\n")
+          f"修复：  ag repair   （预览：ag repair --dry-run）{C['r']}\n")
     return 0
+
+
+def repair_targets(entries):
+    """按 cmd 分组缺失项；同一个可执行文件只跑一次安装命令。"""
+    missing = {}
+    order = []
+    for e in entries:
+        if e.resolved():
+            continue
+        if e.cmd not in missing:
+            missing[e.cmd] = []
+            order.append(e.cmd)
+        missing[e.cmd].append(e)
+
+    fixable, blocked = [], []
+    for cmd in order:
+        group = missing[cmd]
+        installer = next((e for e in group if e.install), None)
+        if installer:
+            fixable.append((installer, group))
+        else:
+            blocked.extend(group)
+    return fixable, blocked
+
+
+def cmd_repair(entries, args):
+    """诊断并修复缺失的 agent。只执行注册表里明确登记的 install。"""
+    dry = "--dry-run" in args or "-n" in args
+    assume_yes = "--yes" in args or "-y" in args
+    unknown = [a for a in args if a not in ("--dry-run", "-n", "--yes", "-y")]
+    if unknown:
+        return die("用法：ag repair [--dry-run] [--yes]")
+
+    fixable, blocked = repair_targets(entries)
+    healthy = sum(1 for e in entries if e.resolved())
+    print(f"\n  {C['b']}ag repair{C['r']}  {C['gry']}注册表：{REGISTRY}{C['r']}\n")
+
+    if not fixable and not blocked:
+        print(f"  {C['grn']}✓ {healthy}/{len(entries)} 可用，没有需要修复的条目{C['r']}\n")
+        return 0
+
+    if fixable:
+        print(f"  {C['b']}可自动修复 {len(fixable)} 个可执行文件：{C['r']}\n")
+        for installer, group in fixable:
+            label = installer.id
+            if len(group) > 1:
+                label += f"（共 {len(group)} 个入口）"
+            print(f"    {C['b']}{pad(label, 24)}{C['r']} "
+                  f"{C['gry']}{trunc(installer.install, 72)}{C['r']}")
+        print(f"\n  {C['yel']}!{C['r']} 安装命令来自注册表，其中可能有 "
+              f"{C['cyn']}curl ... | sh{C['r']}，执行前请确认来源")
+
+    if blocked:
+        print(f"\n  {C['yel']}需要手工处理 {len(blocked)} 条（没有 install 命令）：{C['r']}")
+        for e in blocked:
+            print(f"    {C['b']}{pad(e.id, 16)}{C['r']} "
+                  f"{C['gry']}cmd={e.cmd}{C['r']}")
+
+    print()
+    if dry:
+        print(f"  {C['gry']}--dry-run：只展示计划，没有执行安装{C['r']}\n")
+        return 0
+    if not fixable:
+        print(f"  {C['red']}没有可自动修复的条目，请给缺失项补上 install 命令{C['r']}\n")
+        return 1
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            return die("非交互环境下要执行修复，请明确加 --yes（或先用 --dry-run 预览）")
+        try:
+            ans = input(f"  {C['b']}继续执行？[y/N]{C['r']} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if ans not in ("y", "yes"):
+            print(f"  {C['gry']}已取消{C['r']}\n")
+            return 0
+
+    failed, incomplete = [], []
+    for i, (installer, group) in enumerate(fixable, 1):
+        ids = ", ".join(e.id for e in group)
+        print(f"\n  {C['gry']}[{i}/{len(fixable)}]{C['r']} "
+              f"{C['b']}{installer.name}{C['r']} {C['gry']}({ids}){C['r']}")
+        print(f"  {C['dim']}$ {installer.install}{C['r']}\n")
+        sys.stdout.flush()
+        try:
+            rc = subprocess.run(installer.install, shell=True).returncode
+        except OSError as ex:
+            print(f"  {C['red']}执行失败：{ex}{C['r']}")
+            rc = 1
+        if rc != 0:
+            failed.append((installer.id, rc))
+            print(f"  {C['red']}✗ 安装命令退出码 {rc}{C['r']}")
+            continue
+
+        still_missing = [e for e in group if not e.resolved()]
+        if still_missing:
+            incomplete.append((installer.id, [e.id for e in still_missing]))
+            print(f"  {C['yel']}!{C['r']} 安装命令成功，但当前 PATH 仍找不到 "
+                  f"{C['cyn']}{installer.cmd}{C['r']}")
+        else:
+            print(f"  {C['grn']}✓ 修复完成：{ids}{C['r']}")
+
+    remaining = sum(1 for e in entries if not e.resolved())
+    print(f"\n  {C['b']}修复结果{C['r']}  {C['gry']}仍缺 {remaining}/{len(entries)}{C['r']}")
+    if failed:
+        print(f"  {C['red']}✗ 安装失败 {len(failed)} 条："
+              f"{', '.join(i for i, _ in failed)}{C['r']}")
+    if incomplete:
+        print(f"  {C['yel']}! 已执行安装但未生效 {len(incomplete)} 条："
+              f"{', '.join(i for i, _ in incomplete)}{C['r']}")
+        print(f"  {C['gry']}重开终端后再跑 ag doctor；若仍缺失，检查 PATH 或注册表 cmd{C['r']}")
+    if blocked:
+        print(f"  {C['yel']}! 仍需手工处理 {len(blocked)} 条："
+              f"{', '.join(e.id for e in blocked)}{C['r']}")
+    print()
+    return 1 if failed or incomplete or blocked else 0
 
 
 def cmd_install(entries, args):
@@ -3097,6 +3216,8 @@ def usage():
     ag edit               用 $EDITOR 打开注册表
     ag scan               扫描 PATH，发现装了但没登记的 agent
     ag doctor             体检：哪些能跑、哪些缺
+    ag repair             修复缺失项（默认先确认，--dry-run 预览）
+    ag doctor --fix       体检并修复（等价于 ag repair）
     ag install <id>       按登记的 install 命令安装
     ag install --missing  一键补装所有缺失的
     ag which <id>         显示实际会执行的命令
@@ -3130,7 +3251,8 @@ def main(argv):
 
     sub = {"ls": cmd_ls, "list": cmd_ls, "add": cmd_add, "rm": cmd_rm,
            "remove": cmd_rm, "edit": cmd_edit, "scan": cmd_scan,
-           "doctor": cmd_doctor, "install": cmd_install, "which": cmd_which,
+           "doctor": cmd_doctor, "repair": cmd_repair,
+           "install": cmd_install, "which": cmd_which,
            "resume": cmd_resume, "r": cmd_resume,
            "last": cmd_last, "l": cmd_last,
            "pin": cmd_pin, "unpin": lambda es, ar: cmd_pin(es, ar, remove=True),

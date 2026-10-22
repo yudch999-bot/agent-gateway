@@ -18,7 +18,7 @@ Put them all behind one fuzzy picker, and add your own by editing one line.
 | **同时开几个** | `ag` 里 Tab 多选 / `ag team` / `ag team @组合名` | 一个不够用，还得手动开窗口 |
 | **接着哪个干** | `ag last` / `ag resume` / `Ctrl-R` | 每次都要重新交代上下文 |
 | **翻旧账 / 搬家** | `ag search` / `ag handoff` | 1.8G 会话历史躺着睡觉 |
-| 顺带 | `ag outdated` / `ag update` / `ag stats` / `ag pin` | 批量运维、看习惯 |
+| 顺带 | `ag repair` / `ag outdated` / `ag update` / `ag stats` / `ag pin` | 修复、批量运维、看习惯 |
 
 ![demo](docs/demo.gif)
 
@@ -54,7 +54,7 @@ ag cc --resume   # 参数原样透传
 | 长命令记不住 | `ag ot-design` |
 | 加新 agent 要动 `.zshrc` | `ag add`，存完立刻生效 |
 | 装了但忘了叫什么 | `ag scan` 扫出来 |
-| 不知道哪个还能跑 | `ag doctor` 体检 |
+| 不知道哪个还能跑 | `ag doctor` 体检，`ag repair` 修 |
 
 **原有的 shell 别名一个都不用删**，`ag` 是加在上面的一层。
 
@@ -180,6 +180,10 @@ ag deepseek    →  d
 | `ag edit` | 用 `$EDITOR` 打开注册表 |
 | `ag scan` | 扫描 `PATH`，找出装了但没登记的 |
 | `ag doctor` | 体检：逐条解析真实路径 |
+| **`ag repair`** | **修复缺失项：先预览/确认，再逐条安装并复检** |
+| `ag repair --dry-run` | 只看修复计划，不执行 |
+| `ag repair --yes` | 非交互执行修复 |
+| `ag doctor --fix` | 体检并修复，等价于 `ag repair` |
 | `ag install <id>` | 按登记的 `install` 命令安装 |
 | `ag install --missing` | 一键补装所有缺失的 |
 | **`ag outdated`** | **看哪些有新版本**（npm / brew 能查的都查） |

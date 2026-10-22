@@ -529,6 +529,100 @@ finally:
     shutil.rmtree(UPD_DIR, ignore_errors=True)
 
 say()
+say("15.5) ag repair —— 缺失安装、失败复检、--dry-run / --yes")
+REP_DIR = tempfile.mkdtemp(prefix="ag-repair-")
+REP_REG = os.path.join(REP_DIR, "registry.toml")
+ok_bin = os.path.join(REP_DIR, "ok-agent")
+shared_bin = os.path.join(REP_DIR, "shared-agent")
+fail_bin = os.path.join(REP_DIR, "fail-agent")
+doctor_bin = os.path.join(REP_DIR, "doctor-agent")
+blocked_bin = os.path.join(REP_DIR, "blocked-agent")
+shared_count = os.path.join(REP_DIR, "shared-count")
+
+
+def install_script(path):
+    return (f"printf '#!/bin/sh\\nexit 0\\n' > {shlex.quote(path)}"
+            f" && chmod +x {shlex.quote(path)}")
+
+
+with open(REP_REG, "w", encoding="utf-8") as fh:
+    fh.write(f'''
+[[agent]]
+id = "ok"
+name = "可修复"
+cmd = "{ok_bin}"
+install = "{install_script(ok_bin)}"
+
+[[agent]]
+id = "shared-a"
+name = "共享命令 A"
+cmd = "{shared_bin}"
+install = "printf x >> {shared_count} && {install_script(shared_bin)}"
+
+[[agent]]
+id = "shared-b"
+name = "共享命令 B"
+cmd = "{shared_bin}"
+
+[[agent]]
+id = "fail"
+name = "会失败"
+cmd = "{fail_bin}"
+install = "exit 7"
+
+[[agent]]
+id = "doctor"
+name = "doctor --fix"
+cmd = "{doctor_bin}"
+install = "{install_script(doctor_bin)}"
+
+[[agent]]
+id = "blocked"
+name = "没安装命令"
+cmd = "{blocked_bin}"
+''')
+
+saved_reg = ag.REGISTRY
+saved_stdin = ag.sys.stdin
+ag.REGISTRY = REP_REG
+try:
+    fixable, blocked = ag.repair_targets(ag.load_registry())
+    check("repair 按 cmd 去重：4 个缺失命令 + 1 条手工项",
+          len(fixable) == 4 and [e.id for e in blocked] == ["blocked"],
+          f"fixable={[(i.id, [e.id for e in g]) for i, g in fixable]} blocked={[e.id for e in blocked]}")
+
+    rc, o = runcmd(["repair", "--dry-run"])
+    check("--dry-run 预览可修复项", rc == 0 and "可自动修复 4 个" in o, o[:300])
+    check("--dry-run 点名手工项", "blocked" in o, o[:300])
+    check("--dry-run 不执行安装",
+          not any(os.path.exists(p) for p in (ok_bin, shared_bin, fail_bin, doctor_bin)))
+
+    ag.sys.stdin = io.StringIO()
+    rc, stdout, stderr = runcmd_err(["repair"])
+    check("非交互不给 --yes 时拒绝执行",
+          rc != 0 and "非交互" in stderr, (stdout + stderr)[:300])
+    check("拒绝后没有偷偷安装", not os.path.exists(ok_bin))
+
+    rc, o = runcmd(["repair", "--yes"])
+    check("--yes 执行并返回失败状态", rc == 1, str(rc))
+    check("成功项已修复", os.path.exists(ok_bin) and os.path.exists(shared_bin))
+    check("共享命令只安装一次",
+          open(shared_count, encoding="utf-8").read() == "x",
+          open(shared_count, encoding="utf-8").read() if os.path.exists(shared_count) else "missing")
+    check("安装失败项保持缺失", not os.path.exists(fail_bin))
+    check("失败和手工项都汇报出来",
+          "安装失败 1 条" in o and "仍需手工处理 1 条" in o, o[-500:])
+
+    os.unlink(ok_bin)
+    rc, o = runcmd(["doctor", "--fix", "--yes"])
+    check("doctor --fix 能走修复流程", rc == 1 and os.path.exists(ok_bin), str(rc))
+    check("doctor --fix 输出修复结果", "修复完成：ok" in o, o[-400:])
+finally:
+    ag.REGISTRY = saved_reg
+    ag.sys.stdin = saved_stdin
+    shutil.rmtree(REP_DIR, ignore_errors=True)
+
+say()
 say("16) 会话搜索与交接")
 SESS_DIR = tempfile.mkdtemp(prefix="ag-sess-")
 
