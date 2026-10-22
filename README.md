@@ -175,12 +175,13 @@ ag deepseek    →  d
 | 命令 | 作用 |
 |---|---|
 | `ag ls` | 列出全部（`--all` 含隐藏项，`--json` 机器可读） |
+| **`ag init`** | **在当前项目创建 `.ag.toml` 覆盖** |
 | `ag add` | 向导式添加 |
 | **`ag profile ls`** | **列出 agent profiles（`cc@work`）** |
 | `ag profile add` | 添加 profile（参数 / env / cwd 预设） |
 | `ag profile rm` | 删除 profile |
 | `ag rm <id>` | 删除（保留注释，自动备份） |
-| `ag edit` | 用 `$EDITOR` 打开注册表 |
+| `ag edit` | 用 `$EDITOR` 打开注册表（`--project` 编辑项目配置） |
 | `ag scan` | 扫描 `PATH`，找出装了但没登记的 |
 | **`ag validate`** | **静态检查注册表：重复 id/alias、保留名冲突、坏路径、team 引用** |
 | `ag validate --json` | 机器可读的检查结果 |
@@ -635,6 +636,35 @@ Profile 会继承基础 agent 的 `cmd / resume / sessions / install`，只覆�
 ---
 
 ## 进阶
+
+### 项目级 `.ag.toml`
+
+```bash
+cd ~/work/my-project
+ag init
+ag edit --project
+```
+
+`ag` 会从当前目录向上查找 `.ag.toml`，自动叠加到全局注册表：
+
+- 同 `id` 的 agent 覆盖全局字段
+- `env` 做深度合并
+- 新 agent / team / profile 直接追加
+- 显式设置 `AG_REGISTRY` 时，项目配置不自动加载
+
+```toml
+[[agent]]
+id = "cc"
+cwd = "."
+env = { ANTHROPIC_BASE_URL = "${ANTHROPIC_WORK_URL}" }
+
+[[profile]]
+id = "work"
+agent = "cc"
+args = ["--model", "sonnet"]
+```
+
+`ag path` 会同时打印全局注册表和当前项目配置文件。
 
 ### 用另一份注册表
 

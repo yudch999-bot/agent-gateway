@@ -50,12 +50,29 @@ AG_DIR = os.path.join(HOME, ".agents")
 # 想用别的注册表（比如给项目单独配一份）： export AG_REGISTRY=/path/to/x.toml
 REGISTRY = os.path.expanduser(os.environ.get("AG_REGISTRY")
                               or os.path.join(AG_DIR, "registry.toml"))
+
+
+def find_project_registry(start=None):
+    cur = os.path.abspath(start or os.getcwd())
+    while True:
+        path = os.path.join(cur, ".ag.toml")
+        if os.path.isfile(path):
+            return path
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+PROJECT_REGISTRY = None if os.environ.get("AG_REGISTRY") \
+    else find_project_registry()
+
 # 状态文件跟注册表放一起，换了 AG_REGISTRY 就整套跟着走
 STATE_DIR = os.path.dirname(REGISTRY)
 USAGE = os.path.join(STATE_DIR, "usage.jsonl")   # 追加写，每次启动记一条
 PINS = os.path.join(STATE_DIR, "pins.json")      # 置顶的短名
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 # frecency：每次使用 +1 分，之后按半衰期衰减。
 # 14 天前的使用只剩一半权重 —— 常用来的一直在前面，偶尔用的会慢慢沉下去。
@@ -194,14 +211,64 @@ class Team:
         return f"{self.grid[0]}x{self.grid[1]}" if self.grid else ""
 
 
+def _read_toml(path):
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _block_key(section, d):
+    if not isinstance(d, dict):
+        return None
+    if section == "profile":
+        return f"{d.get('agent', '')}@{d.get('id', '')}".lower()
+    return str(d.get("id", "")).lower()
+
+
+def _merge_section(base, overlay, section):
+    out = [dict(x) if isinstance(x, dict) else x for x in (base or [])]
+    index = {}
+    for i, block in enumerate(out):
+        key = _block_key(section, block)
+        if key:
+            index[key] = i
+    for block in overlay or []:
+        key = _block_key(section, block)
+        if not key or key not in index:
+            if key:
+                index[key] = len(out)
+            out.append(dict(block) if isinstance(block, dict) else block)
+            continue
+        i = index[key]
+        old = out[i]
+        if isinstance(old, dict) and isinstance(block, dict):
+            merged = {**old, **block}
+            if isinstance(old.get("env"), dict) and isinstance(block.get("env"), dict):
+                merged["env"] = {**old["env"], **block["env"]}
+            out[i] = merged
+        else:
+            out[i] = dict(block) if isinstance(block, dict) else block
+    return out
+
+
+def registry_data(path=None):
+    """读全局注册表；未指定路径时叠加向上找到的 .ag.toml。"""
+    if path:
+        return _read_toml(path) if os.path.exists(path) else {}
+    data = _read_toml(REGISTRY) if os.path.exists(REGISTRY) else {}
+    if PROJECT_REGISTRY and os.path.exists(PROJECT_REGISTRY):
+        overlay = _read_toml(PROJECT_REGISTRY)
+        for section in ("agent", "team", "profile"):
+            if section in overlay:
+                data[section] = _merge_section(data.get(section, []),
+                                               overlay.get(section, []),
+                                               section)
+    return data
+
+
 def load_registry(path=None):
     # 注意别写成 path=REGISTRY：默认参数在「函数定义时」就绑定死了，
     # 之后改 ag.REGISTRY（比如测试里指向临时文件）它不会跟。
-    path = path or REGISTRY
-    if not os.path.exists(path):
-        return []
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
+    data = registry_data(path)
     out = []
     for d in data.get("agent", []):
         e = Entry(d)
@@ -221,11 +288,7 @@ def find_entry(entries, key):
 
 def load_teams(path=None):
     """读注册表里的 [[team]] 块。坏块/空块直接跳过。"""
-    path = path or REGISTRY
-    if not os.path.exists(path):
-        return []
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
+    data = registry_data(path)
     out = []
     for d in data.get("team", []):
         t = Team(d)
@@ -282,11 +345,7 @@ class Profile:
 
 
 def load_profiles(path=None):
-    path = path or REGISTRY
-    if not os.path.exists(path):
-        return []
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
+    data = registry_data(path)
     out = []
     for d in data.get("profile", []):
         p = Profile(d)
@@ -3412,6 +3471,36 @@ def remove_profile_block(ref):
     return dropped
 
 
+def cmd_init(entries, args):
+    force = "--force" in args
+    unknown = [a for a in args if a not in ("--force",)]
+    if unknown:
+        return die("用法：ag init [--force]")
+    path = os.path.join(os.getcwd(), ".ag.toml")
+    if os.path.exists(path) and not force:
+        return die(f"{path} 已存在；要覆盖请加 --force")
+    content = """# ag project config
+# 自动从当前目录向上查找；与 ~/.agents/registry.toml 合并。
+# 同 id 的 [[agent]] 会覆盖全局字段（env 会深度合并）。
+#
+# [[agent]]
+# id = "cc"
+# cwd = "."
+# env = { ANTHROPIC_BASE_URL = "${ANTHROPIC_WORK_URL}" }
+#
+# [[profile]]
+# id = "work"
+# agent = "cc"
+# args = ["--model", "sonnet"]
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"  {C['grn']}✓ 已创建 {path}{C['r']}")
+    print(f"  {C['gry']}编辑：{C['cyn']}ag edit{C['r']}"
+          f"{C['gry']} 或直接改这个文件；下次运行自动生效{C['r']}")
+    return 0
+
+
 def cmd_profile(entries, args):
     profiles = load_profiles()
     as_json = "--json" in args
@@ -3659,7 +3748,7 @@ def cmd_scan(entries, args):
 
 
 RESERVED_COMMANDS = set("""
-ls list add rm remove edit scan validate doctor repair install which resume r
+ls list init add rm remove edit scan validate doctor repair install which resume r
 last l pin unpin stats update upgrade up outdated old search find s handoff ho
 team teams multi attach ps kill stop path help profile profiles
 """.split())
@@ -3691,12 +3780,13 @@ def validate_registry():
     def warn(code, subject, message):
         issues.append(_issue("warning", code, subject, message))
 
-    if not os.path.exists(REGISTRY):
+    if not os.path.exists(REGISTRY) and not PROJECT_REGISTRY:
         err("registry_missing", REGISTRY, "注册表不存在")
         return {
             "schema_version": 1,
             "ag_version": VERSION,
             "registry": REGISTRY,
+            "project_registry": PROJECT_REGISTRY,
             "agents": 0,
             "teams": 0,
             "profiles": 0,
@@ -3704,14 +3794,15 @@ def validate_registry():
         }
 
     try:
-        with open(REGISTRY, "rb") as f:
-            data = tomllib.load(f)
+        data = registry_data()
     except (OSError, tomllib.TOMLDecodeError) as ex:
-        err("toml_invalid", REGISTRY, f"TOML 解析失败：{ex}")
+        subject = PROJECT_REGISTRY or REGISTRY
+        err("toml_invalid", subject, f"TOML 解析失败：{ex}")
         return {
             "schema_version": 1,
             "ag_version": VERSION,
             "registry": REGISTRY,
+            "project_registry": PROJECT_REGISTRY,
             "agents": 0,
             "teams": 0,
             "profiles": 0,
@@ -3878,6 +3969,7 @@ def validate_registry():
         "schema_version": 1,
         "ag_version": VERSION,
         "registry": REGISTRY,
+        "project_registry": PROJECT_REGISTRY,
         "agents": len(raw_agents),
         "teams": len(raw_teams),
         "profiles": len(raw_profiles),
@@ -3912,6 +4004,8 @@ def cmd_validate(args):
 
     print(f"\n  {C['b']}ag validate{C['r']}  "
           f"{C['gry']}注册表：{REGISTRY}{C['r']}\n")
+    if PROJECT_REGISTRY:
+        print(f"  {C['gry']}项目覆盖：{PROJECT_REGISTRY}{C['r']}\n")
     if not report["issues"]:
         print(f"  {C['grn']}✓ 注册表有效：{report['agents']} 个 agent"
               f" · {report['teams']} 个 team"
@@ -4137,7 +4231,8 @@ def cmd_install(entries, args):
 
 def cmd_edit(entries, args):
     ed = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
-    return subprocess.run([ed, REGISTRY]).returncode
+    target = PROJECT_REGISTRY if "--project" in args and PROJECT_REGISTRY else REGISTRY
+    return subprocess.run([ed, target]).returncode
 
 
 def usage():
@@ -4191,13 +4286,14 @@ def usage():
   {C['b']}管理{C['r']}
     ag ls [--all]         列出全部（--all 含隐藏项）
     ag ls --json          机器可读，方便接别的脚本
+    ag init               在当前目录创建 .ag.toml 项目覆盖
     ag add                向导式添加新 agent
     ag add --id x --cmd y --desc "..." --tags a,b --install "..."
     ag profile ls         列出 agent profiles（如 cc@work）
     ag profile add --agent cc --id work --args "--model ..."
     ag profile rm cc@work 删除 profile
     ag rm <id> [id...]   删除（可一次删多条，注释保留）
-    ag edit               用 $EDITOR 打开注册表
+    ag edit               用 $EDITOR 打开注册表（--project 编辑 .ag.toml）
     ag scan               扫描 PATH，发现装了但没登记的 agent
     ag validate           静态检查注册表（--json / --strict）
     ag doctor             体检：哪些能跑、哪些缺
@@ -4235,9 +4331,12 @@ def main(argv):
         return 0
     if a and a[0] == "path":
         print(REGISTRY)
+        if PROJECT_REGISTRY:
+            print(PROJECT_REGISTRY)
         return 0
 
-    sub = {"ls": cmd_ls, "list": cmd_ls, "add": cmd_add, "rm": cmd_rm,
+    sub = {"ls": cmd_ls, "list": cmd_ls, "init": cmd_init,
+           "add": cmd_add, "rm": cmd_rm,
            "remove": cmd_rm, "edit": cmd_edit, "scan": cmd_scan,
            "doctor": cmd_doctor, "repair": cmd_repair,
            "install": cmd_install, "which": cmd_which,

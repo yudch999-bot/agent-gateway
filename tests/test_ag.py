@@ -626,6 +626,79 @@ finally:
     shutil.rmtree(PROF_DIR, ignore_errors=True)
 
 say()
+say("14.6) 项目级 .ag.toml")
+PROJ_DIR = tempfile.mkdtemp(prefix="ag-project-")
+PROJ_GLOBAL = os.path.join(PROJ_DIR, "global.toml")
+PROJ_OVERLAY = os.path.join(PROJ_DIR, "project.toml")
+with open(PROJ_GLOBAL, "w", encoding="utf-8") as f:
+    f.write('''
+[[agent]]
+id = "cc"
+name = "Claude"
+cmd = "echo"
+args = ["--base"]
+env = { A = "global", B = "keep" }
+
+[[team]]
+id = "pair"
+agents = ["cc"]
+''')
+with open(PROJ_OVERLAY, "w", encoding="utf-8") as f:
+    f.write('''
+[[agent]]
+id = "cc"
+name = "Claude Project"
+args = ["--project"]
+env = { A = "project", C = "new" }
+cwd = "/tmp"
+
+[[agent]]
+id = "px"
+name = "Project Only"
+cmd = "echo"
+
+[[team]]
+id = "pair"
+agents = ["cc", "px"]
+layout = "windows"
+
+[[profile]]
+id = "work"
+agent = "cc"
+args = ["--model", "sonnet"]
+''')
+saved_reg, saved_project = ag.REGISTRY, ag.PROJECT_REGISTRY
+ag.REGISTRY, ag.PROJECT_REGISTRY = PROJ_GLOBAL, PROJ_OVERLAY
+try:
+    ents = ag.load_registry()
+    by_id = {e.id: e for e in ents}
+    check("project 覆盖同 id agent（args 替换、env 深度合并）",
+          by_id["cc"].args == ["--project"]
+          and by_id["cc"].env == {"A": "project", "B": "keep", "C": "new"}
+          and by_id["cc"].cwd == "/tmp", str((by_id["cc"].args, by_id["cc"].env)))
+    check("project 新增 agent", "px" in by_id)
+    teams = ag.load_teams()
+    check("project team 覆盖", teams[0].agents == ["cc", "px"]
+          and teams[0].layout == "windows", str(teams[0].agents))
+    check("project profile 合并",
+          ag.find_profile(ag.load_profiles(), "cc@work") is not None)
+    rc, o = runcmd(["path"])
+    check("ag path 同时显示全局和项目注册表",
+          PROJ_GLOBAL in o and PROJ_OVERLAY in o, o)
+
+    old_cwd = os.getcwd()
+    os.chdir(PROJ_DIR)
+    try:
+        rc, o = runcmd(["init"])
+    finally:
+        os.chdir(old_cwd)
+    check("ag init 创建 .ag.toml",
+          rc == 0 and os.path.exists(os.path.join(PROJ_DIR, ".ag.toml")), o[:300])
+finally:
+    ag.REGISTRY, ag.PROJECT_REGISTRY = saved_reg, saved_project
+    shutil.rmtree(PROJ_DIR, ignore_errors=True)
+
+say()
 say("15) 批量升级：命令提取与执行")
 say("  · 包名提取")
 for cmd, want in [("npm i -g @scope/pkg@latest", "@scope/pkg"),
